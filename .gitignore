@@ -1,3 +1,9 @@
 build/
 .cache/
 mqtt_client0/
+build*/
+.local/
+.run/
+.mplcache/
+benchmark/
+dispatch_bench/

@@ -270,8 +270,7 @@ void MqttClient::consume_loop(std::stop_token st) {
         try {
             // paho.mqtt.cpp >= 1.5：bool try_consume_event_for(event*, duration)
             got = inner_->try_consume_event_for(&evt, cfg_.poll_timeout);
-        }
-        catch (const mqtt::exception& e) {
+        } catch (const mqtt::exception& e) {
             spdlog::error("[mqttx] 消费队列异常，退出消费线程: {}", e.what());
             break;
         }
