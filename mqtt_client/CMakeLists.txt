@@ -13,6 +13,7 @@ add_library(mqtt_client STATIC
     topic.hpp
     message.hpp
     imqtt_client.h
+    RpcTopic.hpp
 )
 
 add_library(mqttx::mqtt_client ALIAS mqtt_client)
