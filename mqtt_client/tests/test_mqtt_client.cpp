@@ -1,5 +1,5 @@
 // ---------------------------------------------------------------------------
-// MqttClient + Topic<Svc> 单元测试
+// MqttClient + Topic<Svc, M> 单元测试
 // 全部用例都不需要真实 broker：订阅注册与消息派发都是本地行为。
 // ---------------------------------------------------------------------------
 
@@ -152,7 +152,7 @@ TEST(client_multicast_two_handlers_same_topic) {
 }
 
 // ---------------------------------------------------------------------------
-// Topic<Svc>：生命周期与 move
+// Topic<Svc, M>：生命周期与 move
 // ---------------------------------------------------------------------------
 
 TEST(topic_open_close_and_refcount) {
@@ -160,8 +160,8 @@ TEST(topic_open_close_and_refcount) {
     Robot      a;
     Robot      b;
 
-    Topic<Robot> ta{cli, "sensor/temp", a, &Robot::on_status, 0};
-    Topic<Robot> tb{cli, "sensor/temp", b, &Robot::on_status, 0};
+    Topic<Robot, &Robot::on_status> ta{cli, "sensor/temp", a, 0};
+    Topic<Robot, &Robot::on_status> tb{cli, "sensor/temp", b, 0};
 
     CHECK_FALSE(ta.opened());
     CHECK_EQ(cli.topic_count(), std::size_t{0});
@@ -196,7 +196,7 @@ TEST(topic_destructor_uninstalls) {
     Robot      robot;
 
     {
-        Topic<Robot> t{cli, "a/b", robot, &Robot::on_cmd, 1};
+        Topic<Robot, &Robot::on_cmd> t{cli, "a/b", robot, 1};
         CHECK(t.open());
         CHECK_EQ(cli.topic_count(), std::size_t{1});
     }
@@ -208,7 +208,7 @@ TEST(topic_name_qos_service_accessors) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    Topic<Robot> t{cli, "a/b", robot, &Robot::on_cmd, 2};
+    Topic<Robot, &Robot::on_cmd> t{cli, "a/b", robot, 2};
     CHECK_EQ(t.name(), std::string{"a/b"});
     CHECK_EQ(t.qos(), 2);
     CHECK(&t.service() == &robot);
@@ -226,21 +226,13 @@ TEST(topic_name_qos_service_accessors) {
     CHECK_EQ(cli.handler_count(), std::size_t{1});
 }
 
-TEST(topic_null_handler_throws) {
-    MqttClient cli{test_config()};
-    Robot      robot;
-
-    using Method = void (Robot::*)(const MessageView&);
-    CHECK_THROWS_AS((Topic<Robot>{cli, "a/b", robot, static_cast<Method>(nullptr), 1}),
-                    std::invalid_argument);
-}
-
 /// 强制走 move 构造（先 move 到另一个局部对象再返回，避免被 NRVO 优化掉）：
 /// 目录里的指针必须在移动后重新绑定到新对象
-static Topic<Robot> make_moved_topic(MqttClient& cli, Robot& robot, const std::string& topic) {
-    Topic<Robot> tmp{cli, topic, robot, &Robot::on_cmd, 1};
+static Topic<Robot, &Robot::on_cmd>
+make_moved_topic(MqttClient& cli, Robot& robot, const std::string& topic) {
+    Topic<Robot, &Robot::on_cmd> tmp{cli, topic, robot, 1};
     tmp.open();
-    Topic<Robot> moved{std::move(tmp)};
+    Topic<Robot, &Robot::on_cmd> moved{std::move(tmp)};
     return moved;
 }
 
@@ -248,7 +240,7 @@ TEST(topic_move_ctor_rebinds_registration) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    Topic<Robot> t = make_moved_topic(cli, robot, "a/b");
+    Topic<Robot, &Robot::on_cmd> t = make_moved_topic(cli, robot, "a/b");
 
     CHECK(t.opened());
     CHECK_EQ(cli.topic_count(), std::size_t{1});
@@ -262,11 +254,11 @@ TEST(topic_move_assignment_rebinds_registration) {
     Robot      a;
     Robot      b;
 
-    Topic<Robot> ta{cli, "a/b", a, &Robot::on_cmd, 1};
+    Topic<Robot, &Robot::on_cmd> ta{cli, "a/b", a, 1};
     CHECK(ta.open());
 
     {
-        Topic<Robot> tb{cli, "c/d", b, &Robot::on_cmd, 1};
+        Topic<Robot, &Robot::on_cmd> tb{cli, "c/d", b, 1};
         CHECK(tb.open());
         CHECK_EQ(cli.topic_count(), std::size_t{2});
 
@@ -284,11 +276,11 @@ TEST(topic_moved_from_object_is_inert) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    Topic<Robot> t1{cli, "a/b", robot, &Robot::on_cmd, 1};
+    Topic<Robot, &Robot::on_cmd> t1{cli, "a/b", robot, 1};
     CHECK(t1.open());
     CHECK_EQ(cli.topic_count(), std::size_t{1});
 
-    Topic<Robot> t2{std::move(t1)};
+    Topic<Robot, &Robot::on_cmd> t2{std::move(t1)};
     CHECK_FALSE(t1.opened());          // 移动源不再持有注册
     CHECK_THROWS_AS(t1.publish("x"), std::logic_error);
     CHECK_THROWS_AS(t1.client(), std::logic_error);
@@ -307,7 +299,7 @@ TEST(topic_supports_const_member_function) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    Topic<Robot> t{cli, "a/ping", robot, &Robot::on_ping, 1};
+    Topic<Robot, &Robot::on_ping> t{cli, "a/ping", robot, 1};
     CHECK(t.open());
     CHECK_EQ(cli.dispatch("a/ping", make_view("a/ping", "?")), std::size_t{1});
     CHECK_EQ(robot.const_calls, 1);
@@ -392,7 +384,7 @@ TEST(sync_handler_leaves_nothing_to_wait_for) {
     Robot      robot;
 
     {
-        Topic<Robot> t{cli, "a/sync", robot, &Robot::on_cmd, 1};
+        Topic<Robot, &Robot::on_cmd> t{cli, "a/sync", robot, 1};
         CHECK(t.open());
         CHECK_EQ(cli.topic_count(), std::size_t{1});
         CHECK_EQ(cli.dispatch("a/sync", make_view("a/sync", "x")), std::size_t{1});

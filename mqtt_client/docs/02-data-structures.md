@@ -8,7 +8,7 @@
 | 结构 | 拥有者 | 生命周期 | 备注 |
 | --- | --- | --- | --- |
 | `MqttClient` | 应用 | 最长（不要晚于其 Session/service） | 不可拷贝不可移动 |
-| `Topic<Svc>` | 应用（通常作为 Session 成员） | 由应用决定；析构即摘除注册 | 可 move，不可拷贝 |
+| `Topic<Svc, M>` | 应用（通常作为 Session 成员） | 由应用决定；析构即摘除注册 | 可 move，不可拷贝 |
 | 业务 service 对象 | 应用 | **必须长于**引用它的 Topic（见 `05` 成员顺序约定） | 库不持有 |
 | `Slot` | `TopicDirectory`（`by_slot_` + `dir_` 各持一份 `shared_ptr`） | 最后一个引用消失时 | 也被 `Lease` 持有 |
 | `Lease` | 由 handler 调用产生的 `MessageView` 副本共享 | 最后一份副本消失时 | 每次调用一份 |
@@ -117,22 +117,23 @@ struct MessageView {
 2. **输出**：`TopicDirectory::dispatch` 为每次 handler 调用**换入新的凭据**
    （持有消息 + 该 handler 的 `Slot`），于是"拷贝视图"就自动等价于"声明我还在使用"。
 
-## 2.5 用户层：`Topic<Svc>`
+## 2.5 用户层：`Topic<Svc, M>`
 
 ```cpp
+template <typename Svc, auto M = nullptr> class Topic;
+
 MqttClient*   cli_;        // nullptr ⇒ 已被 move（此时 open/publish/client 会拒绝或抛错）
 std::string   topic_;      // topic filter（可含 + / #）
 Svc*          svc_;        // 处理者：成员函数模式下指向外部对象；拥有型模式下指向 owned_
 unique_ptr<Svc> owned_;    // 仅"可调用对象"模式使用
-Method        method_;     // void (Svc::*)(const MessageView&)
-ConstMethod   cmethod_;    // void (Svc::*)(const MessageView&) const
 int           qos_;        // -1 ⇒ 用 MqttClient 的默认 QoS
 uint64_t      slot_;       // 0 ⇒ 未注册
 ```
 
-三种处理器形态在 `invoke()` 里分支：非 const 成员函数 → const 成员函数 → 拥有型可调用对象
-（第三支用 `if constexpr (std::is_invocable_v<Svc&, const MessageView&>)` 做编译期裁剪，
-因此 `Svc` 不可调用时不会产生错误代码）。
+成员函数由模板参数 `M` 在编译期确定：`M != nullptr` 时 `invoke()` 直接调用
+`(svc_->*M)(msg)`（const 成员函数则经 `const Svc*`），没有运行时分支或间接调用；
+`M == nullptr` 时使用拥有型可调用对象，并以
+`if constexpr (std::is_invocable_v<Svc&, const MessageView&>)` 做编译期裁剪。
 
 ## 2.6 不变式清单
 

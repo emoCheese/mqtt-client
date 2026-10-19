@@ -5,7 +5,7 @@
 生命周期）全部由库负责。
 
 ```
-     Topic<Svc> / TopicFn            TopicDirectory                paho.mqtt.cpp
+     Topic<Svc, M> / TopicFn         TopicDirectory                paho.mqtt.cpp
    ┌────────────────────┐        ┌──────────────────────┐       ┌───────────────┐
    │ robot/+/cmd → svc  │ open() │ robot/+/cmd → [h1,h2]│ SUB→  │ async_client  │
    │ robot/#     → λ    │ ─────► │ robot/#     → [h3]   │ ◄─MSG │ consumer queue│
@@ -19,7 +19,7 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `topic.hpp` | `Topic<Svc>` / `TopicFn`：把一个 topic filter 绑定到成员函数或可调用对象 |
+| `topic.hpp` | `Topic<Svc, M>` / `TopicFn`：把一个 topic filter 绑定到成员函数或可调用对象 |
 | `mqtt_client.hpp/.cpp` | `MqttClient`：连接、消费线程、订阅补齐、发布 |
 | `topic_directory.hpp/.cpp` | `TopicDirectory`：topic filter → handler 的目录（多播、引用计数、生命周期安全） |
 | `topic_filter.hpp` | MQTT topic filter 匹配规则（`+` / `#` / `$` 规则） |
@@ -60,8 +60,8 @@ cfg.broker_url = "tcp://127.0.0.1:1883";
 mqttx::MqttClient cli{cfg};
 
 Robot robot;
-mqttx::Topic<Robot> cmd{cli, "robot/+/cmd", robot, &Robot::on_cmd, /*qos=*/1};
-mqttx::Topic<Robot> status{cli, "robot/+/status", robot, &Robot::on_status, 0};
+mqttx::Topic<Robot, &Robot::on_cmd>    cmd{cli, "robot/+/cmd", robot, /*qos=*/1};
+mqttx::Topic<Robot, &Robot::on_status> status{cli, "robot/+/status", robot, 0};
 auto alarm = mqttx::make_topic(cli, "robot/alarm", [](const mqttx::MessageView& m) {
     // lambda 形式
 });
@@ -115,7 +115,7 @@ cli.stop();                       // 幂等；析构也会调用
 
 - **派发线程只有一个**（消费线程），`dispatch()` 不持有目录锁调用用户代码，
   因此在 handler 里 `open()` / `close()` 别的 Topic（甚至自己）都不会死锁；
-- 同一个 `Topic<Svc>` 被 move 之后会自动 `rebind`，目录里的指针始终指向存活对象；
+- 同一个 `Topic<Svc, M>` 被 move 之后会自动 `rebind`，目录里的指针始终指向存活对象；
 - `close()` / 析构会等待该 handler 的**在飞调用返回**，并且继续等待 handler
   派生出去的**异步任务释放消息副本**（见下一节），之后目标对象才会被回收；
 - `Topic::publish()` / `client()` 在被 move 走的对象上调用会抛 `std::logic_error`；

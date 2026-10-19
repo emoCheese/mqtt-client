@@ -53,8 +53,8 @@ private:
 class RobotSession {
 public:
     explicit RobotSession(MqttClient& cli)
-        : cmd_{cli, "robot/+/cmd", svc_, &RobotService::on_cmd, 1}
-        , status_{cli, "robot/+/status", svc_, &RobotService::on_status, 0}
+        : cmd_{mqttx::make_topic<&RobotService::on_cmd>(cli, "robot/+/cmd", svc_, 1)}
+        , status_{mqttx::make_topic<&RobotService::on_status>(cli, "robot/+/status", svc_, 0)}
         , alarm_{mqttx::make_topic(cli, "robot/alarm", [this](const MessageView& m) {
               std::cout << "  [alarm]  payload=" << m.payload << '\n';
               ++alarms_;
@@ -74,9 +74,9 @@ public:
 
 private:
     RobotService                     svc_;
-    mqttx::Topic<RobotService>       cmd_;
-    mqttx::Topic<RobotService>       status_;
-    mqttx::TopicFn                   alarm_;  ///< 可调用对象形式
+    mqttx::Topic<RobotService, &RobotService::on_cmd>    cmd_;
+    mqttx::Topic<RobotService, &RobotService::on_status> status_;
+    mqttx::TopicFn                                       alarm_;  ///< 可调用对象形式
     int                              alarms_{0};
 };
 

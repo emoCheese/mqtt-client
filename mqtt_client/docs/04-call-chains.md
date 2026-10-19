@@ -39,7 +39,7 @@
 ## ② 注册链（应用线程，或 handler 内）
 
 ```
-Topic<Svc>::open()                                 [topic.hpp]
+Topic<Svc, M>::open()                              [topic.hpp]
 ├─ slot_ != 0                    ⇒ return true（幂等）
 ├─ cli_ == nullptr || svc_ == nullptr ⇒ return false（已被 move）
 └─ slot_ = cli_->install(topic_, this, &Topic::invoke, qos_)
@@ -111,10 +111,10 @@ MqttClient::consume_loop(st)                        [mqtt_client.cpp]
             └─ try h->fn(obj, call)                       ← 唯一进入用户代码的位置
                catch std::exception / ... ⇒ 记日志，继续下一个 handler
                   │
-                  └─ Topic<Svc>::invoke(self, msg)        [topic.hpp]
-                     ├─ method_  ⇒ (svc_->*method_)(msg)          （非 const 成员函数）
-                     ├─ cmethod_ ⇒ (const Svc*->*cmethod_)(msg)   （const 成员函数）
-                     └─ else     ⇒ (*svc_)(msg)                   （拥有型可调用对象）
+                  └─ Topic<Svc, M>::invoke(self, msg)     [topic.hpp]
+                     ├─ M 可用 const Svc* 调用 ⇒ (const Svc*->*M)(msg)（const 成员函数）
+                     ├─ M 是成员函数指针       ⇒ (svc_->*M)(msg)      （非 const 成员函数）
+                     └─ else                   ⇒ (*svc_)(msg)         （拥有型可调用对象）
 ```
 
 ## ④ 摘除链（应用线程 / 析构 / handler 内）
@@ -151,10 +151,10 @@ MqttClient::consume_loop(st)                        [mqtt_client.cpp]
 ## ⑤ move 链
 
 ```
-Topic<Svc>::Topic(Topic&& o) noexcept               [topic.hpp]
+Topic<Svc, M>::Topic(Topic&& o) noexcept            [topic.hpp]
 ├─ cli_ = exchange(o.cli_, nullptr)
 ├─ topic_ = move(o.topic_)；svc_ = o.svc_；owned_ = move(o.owned_)
-├─ method_/cmethod_/qos_ = o.*
+├─ qos_ = o.qos_
 ├─ slot_ = exchange(o.slot_, 0)                     ← 移动源从此"失活"（I15）
 ├─ owned_ 非空 ⇒ svc_ = owned_.get()                ← 拥有型：修正自持有指针
 └─ slot_ != 0 && cli_ != nullptr ⇒ cli_->rebind(slot_, this)
@@ -192,7 +192,7 @@ consume_loop 收到 evt.is_connected()（自动重连成功时 paho 会推该事
 ## ⑦ 发布链
 
 ```
-Topic<Svc>::publish(payload, qos, retain)            [topic.hpp]
+Topic<Svc, M>::publish(payload, qos, retain)         [topic.hpp]
 ├─ require_client()  cli_ == nullptr ⇒ throw std::logic_error（已被 move）
 └─ MqttClient::publish(topic_, move(payload), qos, retain)
    │

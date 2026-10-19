@@ -28,7 +28,7 @@
 | **handler** | 一次注册对应的处理逻辑：`InvokeFn = void(*)(void*, const MessageView&)` |
 | **slot / 句柄** | `install()` 返回的 `uint64_t`，代表"一个 Topic 对象的一次注册" |
 | **登记项** | 目录内部的 `Slot` 结构，与 slot 一一对应（含目标指针、两个计数器） |
-| **thunk** | 编译期生成的静态跳板 `Topic<Svc>::invoke`，把类型擦除的 `void*` 还原成 `Topic<Svc>*` |
+| **thunk** | 编译期生成的静态跳板 `Topic<Svc, M>::invoke`，把类型擦除的 `void*` 还原成 `Topic<Svc, M>*` |
 | **借用视图** | `MessageView`：`topic`/`payload`/`props` 指向底层 paho 消息，不拥有数据 |
 | **保活凭据** | `KeepAlive`：引用计数句柄，同时持有底层消息与登记项，随 `MessageView` 副本流动 |
 | **在飞调用** | 正在执行 `h->fn(...)` 的调用帧，由 `Slot::inflight` 计数 |
@@ -49,7 +49,7 @@
 
 ```
 mqtt_client/
-├── topic.hpp                  用户层：Topic<Svc> / TopicFn / make_topic
+├── topic.hpp                  用户层：Topic<Svc, M> / TopicFn / make_topic
 ├── imqtt_client.h             契约层：start/stop/install/uninstall/rebind
 ├── mqtt_client.hpp/.cpp       传输层：连接、消费线程、订阅补齐、发布、本地注入
 ├── topic_directory.hpp/.cpp   路由层：filter→handler 目录 + 生命周期协议（本库核心）

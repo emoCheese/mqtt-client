@@ -10,7 +10,6 @@ list(APPEND CMAKE_PREFIX_PATH "/home/fox/workspace/my-cpp-3rdparty/install_share
 enable_testing()
 
 add_subdirectory(mqtt_client)
-add_subdirectory(mqtt_client0)
 
 add_executable(test_main main.cpp)
 

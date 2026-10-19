@@ -90,10 +90,10 @@ int main(int argc, char** argv) {
     Counters   counters;
     Service    svc{&counters};
 
-    Topic<Service> exact{cli, "it/1/cmd", svc, &Service::on_exact, 1};
-    Topic<Service> plus{cli, "it/+/cmd", svc, &Service::on_plus, 1};
-    auto           hash = make_topic(cli, "it/#", [&](const MessageView&) { counters.bump(counters.hash); }, 1);
-    Topic<Service> idle{cli, "never/used", svc, &Service::on_exact, 1};
+    Topic<Service, &Service::on_exact> exact{cli, "it/1/cmd", svc, 1};
+    Topic<Service, &Service::on_plus>  plus{cli, "it/+/cmd", svc, 1};
+    auto hash = make_topic(cli, "it/#", [&](const MessageView&) { counters.bump(counters.hash); }, 1);
+    Topic<Service, &Service::on_exact> idle{cli, "never/used", svc, 1};
 
     // 异步 handler：把 MessageView 副本投递到“线程池”（这里用 detached 线程模拟），
     // 调用帧立刻返回，但凭据让消息数据与登记项一直活到任务结束。

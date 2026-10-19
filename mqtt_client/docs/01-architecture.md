@@ -19,9 +19,9 @@
 ```
 ┌─ 用户层 ────────────────────────────────────────────────────────────────┐
 │  topic.hpp                                                              │
-│    Topic<Svc>        cli, filter, svc, &Svc::method, qos                 │
+│    Topic<Svc, M>     cli, filter, svc, qos（M = &Svc::method）           │
 │    TopicFn           = Topic<std::function<void(const MessageView&)>>    │
-│    make_topic(...)   lambda 便捷工厂                                     │
+│    make_topic(...)   成员函数 / lambda 便捷工厂                          │
 │  职责：把"一个 filter 绑定到一个处理器"表达出来；open/close 幂等；move 自动 rebind │
 └──────────────────────────────┬──────────────────────────────────────────┘
                                │ install / uninstall / rebind / publish
@@ -80,7 +80,7 @@ topic.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► topi
 
 ```
         ┌────────────── 用户线程 ──────────────┐
-        │ Topic<Svc> t{cli,"robot/+/cmd",...}  │
+        │ Topic<Svc, M> t{cli,"robot/+/cmd",...} │
         │ t.open()  ──► install()              │
         └───────────────┬──────────────────────┘
                         │ ① 注册（filter, thunk, void*）
@@ -98,7 +98,7 @@ topic.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► topi
                                                       │ ⑤ 精确 + 通配匹配，收集 Snapshot
                                                       │ ⑥ 每个 handler：Lease（async_refs+1）
                                                       ▼
-                                             Topic<Svc>::invoke ──► svc.on_x(view)
+                                             Topic<Svc, M>::invoke ──► svc.on_x(view)
                                                       │
                      ⑦ 同步返回 → inflight-1          │  ⑦' 异步：pool.post([copy=view])
                      ⑧ 摘除：等 inflight → 等 async_refs │      → 任务结束才释放凭据

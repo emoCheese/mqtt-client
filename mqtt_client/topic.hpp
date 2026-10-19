@@ -1,27 +1,31 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Topic<Svc> —— 以 topic 为核心的绑定句柄
+// Topic<Svc, M> —— 以 topic 为核心的绑定句柄
 //
-//   mqttx::Topic<Session> t{cli, "robot/+/cmd", session, &Session::on_cmd, 1};
+//   mqttx::Topic<Session, &Session::on_cmd> t{cli, "robot/+/cmd", session, 1};
 //   t.open();                       // 显式注册（构造期不把 this 交出去）
+//
+//   // 或用工厂：auto t = mqttx::make_topic<&Session::on_cmd>(cli, ...);
 //
 // 设计要点：
 //   1. 构造只保存参数，不注册；必须显式 open()，析构自动 close()；
 //   2. 必须在 Topic 完全构造之后再 open()（例如 Session 构造体末尾统一 open）；
 //   3. topic 是 MQTT topic filter，可含 '+' / '#'：到达的消息按 filter 规则路由；
 //   4. move 之后自动 rebind，保证目录里的回调指针始终指向存活对象；
-//   5. 一个 filter 可以被多个 Topic 绑定（多播），引用计数归零才退订。
+//   5. 一个 filter 可以被多个 Topic 绑定（多播），引用计数归零才退订；
+//   6. 成员函数由模板参数 M 在编译期确定，没有运行时分支或间接调用。
 //
 // 支持三种处理器形式：
-//   - 非 const 成员函数：Topic<Svc>{cli, topic, svc, &Svc::on_msg, qos}
-//   - const 成员函数    ：Topic<Svc>{cli, topic, svc, &Svc::on_msg, qos}
+//   - 非 const 成员函数：Topic<Svc, &Svc::on_msg>{cli, topic, svc, qos}
+//   - const 成员函数    ：Topic<Svc, &Svc::on_msg>{cli, topic, svc, qos}
 //   - 可调用对象        ：make_topic(cli, topic, [](const MessageView& m){...}, qos)
 // ---------------------------------------------------------------------------
 
 #include "message.hpp"
 #include "mqtt_client.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -32,26 +36,20 @@
 
 namespace mqttx {
 
-template <typename Svc>
+template <typename Svc, auto M = nullptr>
 class Topic {
 public:
-    using Method      = void (Svc::*)(const MessageView&);
-    using ConstMethod = void (Svc::*)(const MessageView&) const;
-
-    /// 绑定到 svc 的非 const 成员函数
-    Topic(MqttClient& cli, std::string topic, Svc& svc, Method method, int qos = -1)
-        : cli_{&cli}, topic_{std::move(topic)}, svc_{&svc}, method_{require(method)}, qos_{qos} {
-    }
-
-    /// 绑定到 svc 的 const 成员函数
-    Topic(MqttClient& cli, std::string topic, Svc& svc, ConstMethod method, int qos = -1)
-        : cli_{&cli}, topic_{std::move(topic)}, svc_{&svc}, cmethod_{require(method)}, qos_{qos} {
-    }
+    /// 绑定到 svc 的成员函数（const / 非 const 均可，M 在编译期已知）
+    Topic(MqttClient& cli, std::string topic, Svc& svc, int qos = -1)
+        requires std::is_member_function_pointer_v<decltype(M)> &&
+                 std::is_invocable_v<decltype(M), Svc*, const MessageView&>
+        : cli_{&cli}, topic_{std::move(topic)}, svc_{&svc}, qos_{qos} {}
 
     /// 拥有型：绑定到可调用对象（lambda / 函数对象 / std::function）
     template <typename F>
-        requires(!std::is_same_v<std::remove_cvref_t<F>, Svc>) &&
-                std::is_constructible_v<Svc, F> && std::is_invocable_v<Svc&, const MessageView&>
+        requires std::is_null_pointer_v<decltype(M)> &&
+                 std::is_constructible_v<Svc, F> &&
+                 std::is_invocable_v<Svc&, const MessageView&>
     Topic(MqttClient& cli, std::string topic, F&& fn, int qos = -1)
         : cli_{&cli}
         , topic_{std::move(topic)}
@@ -71,8 +69,6 @@ public:
         , topic_{std::move(o.topic_)}
         , svc_{o.svc_}
         , owned_{std::move(o.owned_)}
-        , method_{o.method_}
-        , cmethod_{o.cmethod_}
         , qos_{o.qos_}
         , slot_{std::exchange(o.slot_, 0)} {
         if (owned_) svc_ = owned_.get();
@@ -87,8 +83,6 @@ public:
             topic_   = std::move(o.topic_);
             svc_     = o.svc_;
             owned_   = std::move(o.owned_);
-            method_  = o.method_;
-            cmethod_ = o.cmethod_;
             qos_     = o.qos_;
             slot_    = std::exchange(o.slot_, 0);
             if (owned_) svc_ = owned_.get();
@@ -147,12 +141,6 @@ public:
     [[nodiscard]] MqttClient&        client() const { return require_client(); }
 
 private:
-    template <typename M>
-    static M require(M method) {
-        if (method == nullptr) throw std::invalid_argument("mqttx::Topic: 处理器不能为空");
-        return method;
-    }
-
     [[nodiscard]] MqttClient& require_client() const {
         if (cli_ == nullptr) throw std::logic_error("mqttx::Topic: 未绑定客户端（对象已被移动）");
         return *cli_;
@@ -160,17 +148,17 @@ private:
 
     static void invoke(void* self, const MessageView& msg) {
         auto* t = static_cast<Topic*>(self);
-        if (t->method_ != nullptr) {
-            (t->svc_->*t->method_)(msg);
-            return;
-        }
-        if (t->cmethod_ != nullptr) {
-            (static_cast<const Svc*>(t->svc_)->*t->cmethod_)(msg);
-            return;
-        }
-        // 拥有型可调用对象；Svc 不可调用时该分支在编译期被丢弃
-        if constexpr (std::is_invocable_v<Svc&, const MessageView&>) {
-            if (t->svc_ != nullptr) (*t->svc_)(msg);
+        if constexpr (std::is_member_function_pointer_v<decltype(M)>) {
+            // const 成员函数判定：能否用 const Svc* 调用 M
+            if constexpr (std::is_invocable_v<decltype(M), const Svc*, const MessageView&>) {
+                (static_cast<const Svc*>(t->svc_)->*M)(msg);   // 直接调用，可内联
+            } else {
+                (t->svc_->*M)(msg);                            // 直接调用，可内联
+            }
+        } else {
+            if constexpr (std::is_invocable_v<Svc&, const MessageView&>) {
+                if (t->svc_ != nullptr) (*t->svc_)(msg);       // Svc 编译期已知，可内联
+            }
         }
     }
 
@@ -178,16 +166,23 @@ private:
     std::string topic_;
     Svc*        svc_{nullptr};
     std::unique_ptr<Svc> owned_;          ///< 可调用对象模式下自持有
-    Method      method_{nullptr};
-    ConstMethod cmethod_{nullptr};
     int         qos_{-1};
     std::uint64_t slot_{0};
 };
 
-/// 以可调用对象（lambda / std::function）为处理器的 Topic
-using TopicFn = Topic<std::function<void(const MessageView&)>>;
+using TopicFn = Topic<std::function<void(const MessageView&)>, nullptr>;
 
-/// 便捷工厂：auto t = mqttx::make_topic(cli, "a/b", [](const MessageView& m){ ... });
+// ---------- 工厂函数 ----------
+
+/// 成员函数模式：make_topic<&Session::on_cmd>(cli, "robot/+/cmd", session, 1)
+template <auto M, typename Svc>
+    requires std::is_member_function_pointer_v<decltype(M)> &&
+             std::is_invocable_v<decltype(M), Svc*, const MessageView&>
+[[nodiscard]] auto make_topic(MqttClient& cli, std::string topic, Svc& svc, int qos = -1) {
+    return Topic<Svc, M>{cli, std::move(topic), svc, qos};
+}
+
+/// callable 模式：make_topic(cli, "a/b", [](const MessageView& m){...}, 1)
 template <typename F>
     requires std::is_invocable_v<F&, const MessageView&>
 [[nodiscard]] TopicFn make_topic(MqttClient& cli, std::string topic, F&& fn, int qos = -1) {

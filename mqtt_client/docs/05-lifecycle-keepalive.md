@@ -141,8 +141,8 @@ pool.post([ka = m.keep_alive, payload = std::string{m.payload}, this] { use(payl
 ```
 class Session {
     RobotService            svc_;      // ① 先声明 → 后析构
-    mqttx::Topic<RobotService> cmd_;   // ② 后声明 → 先析构（会等待异步任务）
-    mqttx::Topic<RobotService> st_;
+    mqttx::Topic<RobotService, &RobotService::on_cmd>    cmd_;  // ② 后声明 → 先析构
+    mqttx::Topic<RobotService, &RobotService::on_status> st_;
 };
 ```
 
