@@ -12,7 +12,7 @@
 //   1. 构造只保存参数，不注册；必须显式 open()，析构自动 close()；
 //   2. 必须在 Topic 完全构造之后再 open()（例如 Session 构造体末尾统一 open）；
 //   3. topic 是 MQTT topic filter，可含 '+' / '#'：到达的消息按 filter 规则路由；
-//   4. move 之后自动 rebind，保证目录里的回调指针始终指向存活对象；
+//   4. 目录持有 Handler 本身，move 只搬运 slot，不再需要 rebind；
 //   5. 一个 filter 可以被多个 Topic 绑定（多播），引用计数归零才退订；
 //   6. 成员函数由模板参数 M 在编译期确定，没有运行时分支或间接调用。
 //
@@ -22,13 +22,13 @@
 //   - 可调用对象        ：make_topic(cli, topic, [](const MessageView& m){...}, qos)
 // ---------------------------------------------------------------------------
 
+#include "handler.hpp"
 #include "message.hpp"
 #include "mqtt_client.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -43,7 +43,11 @@ public:
     Topic(MqttClient& cli, std::string topic, Svc& svc, int qos = -1)
         requires std::is_member_function_pointer_v<decltype(M)> &&
                  std::is_invocable_v<decltype(M), Svc*, const MessageView&>
-        : cli_{&cli}, topic_{std::move(topic)}, svc_{&svc}, qos_{qos} {}
+        : cli_{&cli}
+        , topic_{std::move(topic)}
+        , handler_{Handler::member<Svc, M>(svc)}
+        , svc_{&svc}
+        , qos_{qos} {}
 
     /// 拥有型：绑定到可调用对象（lambda / 函数对象 / std::function）
     template <typename F>
@@ -53,11 +57,9 @@ public:
     Topic(MqttClient& cli, std::string topic, F&& fn, int qos = -1)
         : cli_{&cli}
         , topic_{std::move(topic)}
+        , handler_{Handler::callable(std::forward<F>(fn))}
         , svc_{nullptr}
-        , owned_{std::make_unique<Svc>(std::forward<F>(fn))}
-        , qos_{qos} {
-        svc_ = owned_.get();
-    }
+        , qos_{qos} {}
 
     ~Topic() { close(); }
 
@@ -67,26 +69,20 @@ public:
     Topic(Topic&& o) noexcept
         : cli_{std::exchange(o.cli_, nullptr)}
         , topic_{std::move(o.topic_)}
-        , svc_{o.svc_}
-        , owned_{std::move(o.owned_)}
+        , handler_{std::move(o.handler_)}
+        , svc_{std::exchange(o.svc_, nullptr)}
         , qos_{o.qos_}
-        , slot_{std::exchange(o.slot_, 0)} {
-        if (owned_) svc_ = owned_.get();
-        // 目录里仍存着旧对象指针：必须重新绑定到新对象
-        if (slot_ != 0 && cli_ != nullptr) cli_->rebind(slot_, this);
-    }
+        , slot_{std::exchange(o.slot_, 0)} {}
 
     Topic& operator=(Topic&& o) noexcept {
         if (this != &o) {
             close();
             cli_     = std::exchange(o.cli_, nullptr);
             topic_   = std::move(o.topic_);
-            svc_     = o.svc_;
-            owned_   = std::move(o.owned_);
+            handler_ = std::move(o.handler_);
+            svc_     = std::exchange(o.svc_, nullptr);
             qos_     = o.qos_;
             slot_    = std::exchange(o.slot_, 0);
-            if (owned_) svc_ = owned_.get();
-            if (slot_ != 0 && cli_ != nullptr) cli_->rebind(slot_, this);
         }
         return *this;
     }
@@ -94,10 +90,10 @@ public:
     // ---------- 激活 / 卸载（幂等）----------
 
     /// 注册到客户端目录；成功返回 true。
-    bool open() {
+    [[nodiscard]] bool open() {
         if (slot_ != 0) return true;                        // 已激活
-        if (cli_ == nullptr || svc_ == nullptr) return false;
-        slot_ = cli_->install(topic_, this, &Topic::invoke, qos_);
+        if (cli_ == nullptr || !handler_.valid()) return false;
+        slot_ = cli_->install(topic_, handler_, qos_);
         return slot_ != 0;
     }
 
@@ -110,13 +106,27 @@ public:
 
     [[nodiscard]] bool opened() const noexcept { return slot_ != 0; }
 
-    /// 修改 QoS：已激活时重新注册（触发重新 SUBSCRIBE）
+    /// 修改 QoS：已激活时重新注册（触发重新 SUBSCRIBE）。
+    /// 失败时恢复到旧的 QoS 与激活状态。
     void set_qos(int qos) {
         if (qos_ == qos) return;
+        const int  old_qos  = qos_;
         const bool was_open = opened();
         if (was_open) close();
         qos_ = qos;
-        if (was_open) open();
+        if (was_open) {
+            try {
+                if (!open()) {
+                    qos_ = old_qos;
+                    (void)open();
+                }
+            }
+            catch (...) {
+                qos_ = old_qos;
+                (void)open();
+                throw;
+            }
+        }
     }
 
     // ---------- 业务接口 ----------
@@ -136,9 +146,15 @@ public:
 
     [[nodiscard]] const std::string& name() const noexcept { return topic_; }
     [[nodiscard]] int                qos() const noexcept { return qos_; }
-    [[nodiscard]] Svc&               service() noexcept { return *svc_; }
-    [[nodiscard]] const Svc&         service() const noexcept { return *svc_; }
     [[nodiscard]] MqttClient&        client() const { return require_client(); }
+
+    /// 仅成员函数模式可用；可调用对象模式没有可返回的 Svc 对象。
+    [[nodiscard]] Svc& service() requires (!std::is_null_pointer_v<decltype(M)>) {
+        return *require_service();
+    }
+    [[nodiscard]] const Svc& service() const requires (!std::is_null_pointer_v<decltype(M)>) {
+        return *require_service();
+    }
 
 private:
     [[nodiscard]] MqttClient& require_client() const {
@@ -146,26 +162,15 @@ private:
         return *cli_;
     }
 
-    static void invoke(void* self, const MessageView& msg) {
-        auto* t = static_cast<Topic*>(self);
-        if constexpr (std::is_member_function_pointer_v<decltype(M)>) {
-            // const 成员函数判定：能否用 const Svc* 调用 M
-            if constexpr (std::is_invocable_v<decltype(M), const Svc*, const MessageView&>) {
-                (static_cast<const Svc*>(t->svc_)->*M)(msg);   // 直接调用，可内联
-            } else {
-                (t->svc_->*M)(msg);                            // 直接调用，可内联
-            }
-        } else {
-            if constexpr (std::is_invocable_v<Svc&, const MessageView&>) {
-                if (t->svc_ != nullptr) (*t->svc_)(msg);       // Svc 编译期已知，可内联
-            }
-        }
+    [[nodiscard]] Svc* require_service() const {
+        if (svc_ == nullptr) throw std::logic_error("mqttx::Topic: 未绑定服务对象（对象已被移动）");
+        return svc_;
     }
 
     MqttClient* cli_{nullptr};
     std::string topic_;
-    Svc*        svc_{nullptr};
-    std::unique_ptr<Svc> owned_;          ///< 可调用对象模式下自持有
+    Handler     handler_;
+    Svc*        svc_{nullptr};   ///< 仅成员函数模式；可调用对象模式为 nullptr
     int         qos_{-1};
     std::uint64_t slot_{0};
 };

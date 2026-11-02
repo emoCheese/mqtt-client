@@ -85,13 +85,58 @@ TEST(client_install_empty_topic_throws) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    CHECK_THROWS_AS(cli.install("", &robot, [](void*, const MessageView&) {}), std::invalid_argument);
+    CHECK_THROWS_AS(cli.install("", Handler::callable([](const MessageView&) {}), -1),
+                    std::invalid_argument);
+    CHECK_THROWS_AS(cli.install("t/x", Handler{}, -1), std::invalid_argument);
 }
 
 TEST(client_publish_without_connection_throws) {
     MqttClient cli{test_config()};
     CHECK_THROWS_AS(cli.publish("t/x", "payload"), mqtt::exception);
     CHECK_THROWS_AS(cli.publish_binary("t/x", "ab", 2), mqtt::exception);
+}
+
+// ---------------------------------------------------------------------------
+// Handler：成员函数 / const 成员函数 / 可调用对象
+// ---------------------------------------------------------------------------
+
+TEST(handler_member_and_callable_invoke) {
+    MqttClient cli{test_config()};
+    Robot      robot;
+
+    const auto s1 = cli.install("h/member", Handler::member<Robot, &Robot::on_cmd>(robot), 1);
+    const auto s2 = cli.install("h/const", Handler::member<Robot, &Robot::on_ping>(robot), 1);
+    const auto s3 = cli.install("h/callable",
+                                Handler::callable([&robot](const MessageView& m) {
+                                    robot.on_status(m);
+                                }),
+                                1);
+
+    CHECK(s1 != 0);
+    CHECK(s2 != 0);
+    CHECK(s3 != 0);
+    CHECK_EQ(cli.dispatch("h/member", make_view("h/member", "go")), std::size_t{1});
+    CHECK_EQ(cli.dispatch("h/const", make_view("h/const", "?")), std::size_t{1});
+    CHECK_EQ(cli.dispatch("h/callable", make_view("h/callable", "x")), std::size_t{1});
+    CHECK_EQ(robot.cmds.size(), std::size_t{1});
+    CHECK_EQ(robot.const_calls, 1);
+    CHECK_EQ(robot.status_calls, 1);
+}
+
+TEST(handler_copy_and_move_keep_target) {
+    Robot robot;
+
+    auto h  = Handler::callable([&robot](const MessageView& m) { robot.on_status(m); });
+    auto h2 = h;  // 共享 callable 状态
+    auto h3 = std::move(h2);
+
+    CHECK(h.valid());
+    CHECK(h3.valid());
+    CHECK_FALSE(h2.valid());  // 移动后的 Handler 为空
+
+    h(make_view("t", "a"));
+    h3(make_view("t", "b"));
+    CHECK_EQ(robot.status_calls, 2);
 }
 
 // ---------------------------------------------------------------------------
@@ -102,10 +147,7 @@ TEST(client_install_and_dispatch_by_topic) {
     MqttClient cli{test_config()};
     Robot      robot;
 
-    const auto slot = cli.install(
-        "robot/1/cmd", &robot, [](void* obj, const MessageView& m) {
-            static_cast<Robot*>(obj)->on_cmd(m);
-        }, -1);
+    const auto slot = cli.install("robot/1/cmd", Handler::member<Robot, &Robot::on_cmd>(robot), -1);
 
     CHECK(slot != 0);
     CHECK_EQ(cli.topic_count(), std::size_t{1});
@@ -135,8 +177,8 @@ TEST(client_multicast_two_handlers_same_topic) {
     Robot      a;
     Robot      b;
 
-    const auto sa = cli.install("evt", &a, [](void* o, const MessageView& m) { static_cast<Robot*>(o)->on_cmd(m); }, 1);
-    const auto sb = cli.install("evt", &b, [](void* o, const MessageView& m) { static_cast<Robot*>(o)->on_cmd(m); }, 1);
+    const auto sa = cli.install("evt", Handler::member<Robot, &Robot::on_cmd>(a), 1);
+    const auto sb = cli.install("evt", Handler::member<Robot, &Robot::on_cmd>(b), 1);
 
     CHECK(sa != sb);
     CHECK_EQ(cli.topic_count(), std::size_t{1});
@@ -227,16 +269,16 @@ TEST(topic_name_qos_service_accessors) {
 }
 
 /// 强制走 move 构造（先 move 到另一个局部对象再返回，避免被 NRVO 优化掉）：
-/// 目录里的指针必须在移动后重新绑定到新对象
+/// 目录持有 Handler 本身，move 只搬运 slot，注册必须继续有效
 static Topic<Robot, &Robot::on_cmd>
 make_moved_topic(MqttClient& cli, Robot& robot, const std::string& topic) {
     Topic<Robot, &Robot::on_cmd> tmp{cli, topic, robot, 1};
-    tmp.open();
+    (void)tmp.open();
     Topic<Robot, &Robot::on_cmd> moved{std::move(tmp)};
     return moved;
 }
 
-TEST(topic_move_ctor_rebinds_registration) {
+TEST(topic_move_ctor_preserves_registration) {
     MqttClient cli{test_config()};
     Robot      robot;
 
@@ -249,7 +291,7 @@ TEST(topic_move_ctor_rebinds_registration) {
     CHECK_EQ(robot.cmds.at(0), std::string{"moved"});
 }
 
-TEST(topic_move_assignment_rebinds_registration) {
+TEST(topic_move_assignment_preserves_registration) {
     MqttClient cli{test_config()};
     Robot      a;
     Robot      b;
@@ -284,6 +326,7 @@ TEST(topic_moved_from_object_is_inert) {
     CHECK_FALSE(t1.opened());          // 移动源不再持有注册
     CHECK_THROWS_AS(t1.publish("x"), std::logic_error);
     CHECK_THROWS_AS(t1.client(), std::logic_error);
+    CHECK_THROWS_AS(t1.service(), std::logic_error);
     CHECK_NOTHROW(t1.close());         // 幂等且不碰空指针
 
     CHECK_EQ(cli.topic_count(), std::size_t{1});  // 注册仍归 t2
@@ -341,7 +384,7 @@ TEST(topic_close_waits_for_async_handler_copy) {
     auto topic = std::make_unique<TopicFn>(make_topic(cli, "a/async", [&async](const MessageView& m) {
         async.view = m;  // 按值捕获：凭据随副本存活
     }, 1));
-    topic->open();
+    (void)topic->open();
     CHECK_EQ(cli.topic_count(), std::size_t{1});
 
     // 与消费线程一致：视图借用真实 paho 消息，凭据持有该消息

@@ -60,9 +60,9 @@ public:
               ++alarms_;
           }, 2)} {
         // Topic 构造完成后才注册，避免构造期把 this 交给其它线程
-        cmd_.open();
-        status_.open();
-        alarm_.open();
+        (void)cmd_.open();
+        (void)status_.open();
+        (void)alarm_.open();
     }
 
     RobotSession(const RobotSession&)            = delete;
@@ -170,7 +170,7 @@ void demo_async() {
         });
     }, 0);
 
-    topic.open();
+    (void)topic.open();
     cli.dispatch("robot/3/telemetry", msg("robot/3/telemetry", "42", 0));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 让 worker 先跑起来
 

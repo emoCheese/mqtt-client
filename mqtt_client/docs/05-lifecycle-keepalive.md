@@ -185,7 +185,7 @@ C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `cmd_/st_`（`re
 | 自等豁免（R3） | `directory_self_removal_inside_handler_does_not_deadlock` | 无豁免会挂死，由 ctest 超时兜底 |
 | 异常隔离 | `directory_handler_exception_is_isolated` | 抛异常的 handler 不影响同批 |
 | 并发 add/remove/dispatch | `directory_concurrent_add_remove_dispatch` | ASan / TSan 下运行 |
-| move 后 rebind（I15） | `topic_move_ctor_rebinds_registration`、`topic_move_assignment_rebinds_registration`、`topic_moved_from_object_is_inert` | |
+| move 后 rebind（I15） | `topic_move_ctor_preserves_registration`、`topic_move_assignment_preserves_registration`、`topic_moved_from_object_is_inert` | |
 | 重连只补差异订阅（I12） | 端到端测试的 `SUBSCRIBE` 次数断言（`mock_broker.py` 日志） | 首次连接全量、连接事件不重复订阅 |
 | 端到端（真实 socket + 消费线程） | `mqttx_online`（[`../tests/integration/test_online.cpp`](../tests/integration/test_online.cpp)） | 含异步 handler 读回载荷 |
 

@@ -127,10 +127,10 @@ bool MqttClient::is_connected() const noexcept {
 // topic 目录
 // ---------------------------------------------------------------------------
 
-std::uint64_t MqttClient::install(const std::string& topic, void* obj, InvokeFn fn, int qos) {
+std::uint64_t MqttClient::install(const std::string& topic, Handler handler, int qos) {
     const int eff_qos = (qos < 0) ? cfg_.qos : qos;
 
-    const auto res = dir_.add(topic, obj, fn, eff_qos);
+    const auto res = dir_.add(topic, std::move(handler), eff_qos);
 
     // 目录说需要（重新）订阅，且客户端已在运行时才立即下发；
     // 未运行时由 on_connected()/subscribe_all() 统一补齐。
@@ -169,8 +169,6 @@ void MqttClient::uninstall(std::uint64_t slot) noexcept {
         // noexcept：摘除失败也不能让析构路径抛异常
     }
 }
-
-void MqttClient::rebind(std::uint64_t slot, void* obj) noexcept { dir_.rebind(slot, obj); }
 
 std::vector<TopicDirectory::Subscription> MqttClient::subscriptions() const {
     return dir_.subscriptions();

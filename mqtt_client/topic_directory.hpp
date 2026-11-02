@@ -21,6 +21,7 @@
 //        - 若在 handler 内部摘除自己（自析构场景），不会自等死锁。
 // ---------------------------------------------------------------------------
 
+#include "handler.hpp"
 #include "message.hpp"
 
 #include <atomic>
@@ -56,9 +57,6 @@ struct SvEqual {
 /// 以 topic 为核心的回调目录（线程安全）
 class TopicDirectory {
 public:
-    /// handler 的统一调用形式（编译期生成的 thunk，零额外分配）
-    using InvokeFn = void (*)(void* obj, const MessageView& msg);
-
     /// add() 的结果：调用方可据此决定是否发送 SUBSCRIBE
     struct InstallResult {
         std::uint64_t slot{0};       ///< 本次注册的句柄，交给 remove()
@@ -88,17 +86,14 @@ public:
 
     /// 注册一个 handler。topic 为 topic filter（可含 '+' / '#'），
     /// qos 为已解析好的有效 QoS（不接受负值）。
-    /// @throw std::invalid_argument topic 为空或 fn 为空
-    InstallResult add(std::string_view topic, void* obj, InvokeFn fn, int qos);
+    /// @throw std::invalid_argument topic 为空或 handler 无效
+    InstallResult add(std::string_view topic, Handler handler, int qos);
 
     /// 摘除 slot 对应的 handler；必要时阻塞，直到
     ///   1) 该 handler 的在飞调用返回，且
     ///   2) handler 派生出去的异步任务不再持有保活凭据（MessageView::keep_alive）。
     /// @note 幂等：未知 slot 返回 removed=false。
     RemoveResult remove(std::uint64_t slot);
-
-    /// handler 对象被移动后更新其指针；成功返回 true。
-    bool rebind(std::uint64_t slot, void* obj) noexcept;
 
     /// 把消息派发给所有匹配 topic 的 handler，返回实际调用的 handler 数。
     ///
@@ -125,8 +120,7 @@ private:
     /// 一次注册（一个 Topic 对象）对应的登记项
     struct Slot {
         std::uint64_t      slot{0};
-        std::atomic<void*> obj{nullptr};
-        InvokeFn           fn{nullptr};
+        Handler            handler;        ///< 注册后不可变，无需 rebind
         std::atomic<bool>  alive{true};
         std::atomic<int>   inflight{0};    ///< 正在执行该 handler 调用的线程数
         std::atomic<int>   async_refs{0};  ///< 外部仍持有的保活凭据份数

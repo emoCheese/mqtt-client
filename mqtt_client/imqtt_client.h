@@ -7,7 +7,7 @@
 // 不泄漏任何具体传输实现（paho / 测试替身）的细节。
 // ---------------------------------------------------------------------------
 
-#include "message.hpp"
+#include "handler.hpp"
 
 #include <cstdint>
 #include <string>
@@ -16,9 +16,6 @@ namespace mqttx {
 
 class IMqttClient {
 public:
-    /// handler 的统一调用形式（编译期 thunk）
-    using InvokeFn = void (*)(void* obj, const MessageView& msg);
-
     IMqttClient()                            = default;
     IMqttClient(const IMqttClient&)          = delete;
     IMqttClient& operator=(const IMqttClient&) = delete;
@@ -33,13 +30,10 @@ public:
     [[nodiscard]] virtual bool is_running() const noexcept = 0;
 
     /// 注册 topic 的 handler，返回 slot（同一 topic 可注册多个）；qos < 0 用默认值
-    virtual std::uint64_t install(const std::string& topic, void* obj, InvokeFn fn, int qos = -1) = 0;
+    virtual std::uint64_t install(const std::string& topic, Handler handler, int qos = -1) = 0;
 
     /// 摘除 slot（幂等，不抛异常）
     virtual void uninstall(std::uint64_t slot) noexcept = 0;
-
-    /// handler 对象被移动后更新其指针
-    virtual void rebind(std::uint64_t slot, void* obj) noexcept = 0;
 };
 
 }  // namespace mqttx
