@@ -4,6 +4,7 @@ add_executable(mqttx_tests
     test_topic_filter.cpp
     test_topic_directory.cpp
     test_mqtt_client.cpp
+    test_binding.cpp
     mini_test.hpp
 )
 

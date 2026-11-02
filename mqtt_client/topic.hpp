@@ -1,34 +1,30 @@
 #pragma once
 
 // ---------------------------------------------------------------------------
-// Topic<Svc, M> —— 以 topic 为核心的绑定句柄
+// Topic<Svc, M> —— 绑定 + 激活的兼容门面
 //
 //   mqttx::Topic<Session, &Session::on_cmd> t{cli, "robot/+/cmd", session, 1};
 //   t.open();                       // 显式注册（构造期不把 this 交出去）
 //
-//   // 或用工厂：auto t = mqttx::make_topic<&Session::on_cmd>(cli, ...);
+//   // 新代码更推荐直接使用 Binding / Subscription：
+//   auto binding = mqttx::Binding{"robot/+/cmd", mqttx::on<&Session::on_cmd>(session), 1};
+//   auto sub     = binding.open(cli);
 //
 // 设计要点：
-//   1. 构造只保存参数，不注册；必须显式 open()，析构自动 close()；
-//   2. 必须在 Topic 完全构造之后再 open()（例如 Session 构造体末尾统一 open）；
-//   3. topic 是 MQTT topic filter，可含 '+' / '#'：到达的消息按 filter 规则路由；
-//   4. 目录持有 Handler 本身，move 只搬运 slot，不再需要 rebind；
-//   5. 一个 filter 可以被多个 Topic 绑定（多播），引用计数归零才退订；
-//   6. 成员函数由模板参数 M 在编译期确定，没有运行时分支或间接调用。
-//
-// 支持三种处理器形式：
-//   - 非 const 成员函数：Topic<Svc, &Svc::on_msg>{cli, topic, svc, qos}
-//   - const 成员函数    ：Topic<Svc, &Svc::on_msg>{cli, topic, svc, qos}
-//   - 可调用对象        ：make_topic(cli, topic, [](const MessageView& m){...}, qos)
+//   1. Topic 只是 Binding + std::optional<Subscription> 的薄门面；
+//   2. 构造只保存描述，不注册；open() 才产生注册；析构自动退订；
+//   3. 目录持有 Handler 本身，move 只搬运 Subscription，不再需要 rebind；
+//   4. 成员函数由模板参数 M 在编译期确定；可调用对象模式没有 service()。
 // ---------------------------------------------------------------------------
 
+#include "binding.hpp"
 #include "handler.hpp"
 #include "message.hpp"
 #include "mqtt_client.hpp"
 
 #include <cstddef>
-#include <cstdint>
 #include <functional>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -44,10 +40,8 @@ public:
         requires std::is_member_function_pointer_v<decltype(M)> &&
                  std::is_invocable_v<decltype(M), Svc*, const MessageView&>
         : cli_{&cli}
-        , topic_{std::move(topic)}
-        , handler_{Handler::member<Svc, M>(svc)}
-        , svc_{&svc}
-        , qos_{qos} {}
+        , binding_{std::move(topic), Handler::member<Svc, M>(svc), qos}
+        , svc_{&svc} {}
 
     /// 拥有型：绑定到可调用对象（lambda / 函数对象 / std::function）
     template <typename F>
@@ -56,33 +50,30 @@ public:
                  std::is_invocable_v<Svc&, const MessageView&>
     Topic(MqttClient& cli, std::string topic, F&& fn, int qos = -1)
         : cli_{&cli}
-        , topic_{std::move(topic)}
-        , handler_{Handler::callable(std::forward<F>(fn))}
-        , svc_{nullptr}
-        , qos_{qos} {}
+        , binding_{std::move(topic), Handler::callable(std::forward<F>(fn)), qos}
+        , svc_{nullptr} {}
 
-    ~Topic() { close(); }
+    ~Topic() = default;
 
     Topic(const Topic&)            = delete;
     Topic& operator=(const Topic&) = delete;
 
     Topic(Topic&& o) noexcept
         : cli_{std::exchange(o.cli_, nullptr)}
-        , topic_{std::move(o.topic_)}
-        , handler_{std::move(o.handler_)}
-        , svc_{std::exchange(o.svc_, nullptr)}
-        , qos_{o.qos_}
-        , slot_{std::exchange(o.slot_, 0)} {}
+        , binding_{std::move(o.binding_)}
+        , sub_{std::move(o.sub_)}
+        , svc_{std::exchange(o.svc_, nullptr)} {
+        o.sub_.reset();  // optional move 会保留 moved-from 值，显式解除
+    }
 
     Topic& operator=(Topic&& o) noexcept {
         if (this != &o) {
             close();
             cli_     = std::exchange(o.cli_, nullptr);
-            topic_   = std::move(o.topic_);
-            handler_ = std::move(o.handler_);
+            binding_ = std::move(o.binding_);
+            sub_     = std::move(o.sub_);
             svc_     = std::exchange(o.svc_, nullptr);
-            qos_     = o.qos_;
-            slot_    = std::exchange(o.slot_, 0);
+            o.sub_.reset();
         }
         return *this;
     }
@@ -91,38 +82,34 @@ public:
 
     /// 注册到客户端目录；成功返回 true。
     [[nodiscard]] bool open() {
-        if (slot_ != 0) return true;                        // 已激活
-        if (cli_ == nullptr || !handler_.valid()) return false;
-        slot_ = cli_->install(topic_, handler_, qos_);
-        return slot_ != 0;
+        if (opened()) return true;  // 已激活
+        if (cli_ == nullptr) return false;
+        sub_.emplace(binding_.open(*cli_));
+        return true;
     }
 
     /// 从目录摘除（最后一个绑定者会触发 UNSUBSCRIBE）
-    void close() noexcept {
-        if (slot_ == 0 || cli_ == nullptr) return;
-        cli_->uninstall(slot_);
-        slot_ = 0;
-    }
+    void close() noexcept { sub_.reset(); }
 
-    [[nodiscard]] bool opened() const noexcept { return slot_ != 0; }
+    [[nodiscard]] bool opened() const noexcept { return sub_ && sub_->active(); }
 
     /// 修改 QoS：已激活时重新注册（触发重新 SUBSCRIBE）。
     /// 失败时恢复到旧的 QoS 与激活状态。
     void set_qos(int qos) {
-        if (qos_ == qos) return;
-        const int  old_qos  = qos_;
+        if (binding_.qos() == qos) return;
+        const int  old_qos  = binding_.qos();
         const bool was_open = opened();
         if (was_open) close();
-        qos_ = qos;
+        binding_.set_qos(qos);
         if (was_open) {
             try {
                 if (!open()) {
-                    qos_ = old_qos;
+                    binding_.set_qos(old_qos);
                     (void)open();
                 }
             }
             catch (...) {
-                qos_ = old_qos;
+                binding_.set_qos(old_qos);
                 (void)open();
                 throw;
             }
@@ -135,17 +122,17 @@ public:
     /// @throw std::logic_error Topic 已被 move 走
     mqtt::delivery_token_ptr
     publish(std::string payload, int qos = -1, bool retain = false) {
-        return require_client().publish(topic_, std::move(payload), qos, retain);
+        return require_client().publish(binding_.filter(), std::move(payload), qos, retain);
     }
 
     /// 二进制载荷
     mqtt::delivery_token_ptr
     publish_binary(const void* data, std::size_t len, int qos = -1, bool retain = false) {
-        return require_client().publish_binary(topic_, data, len, qos, retain);
+        return require_client().publish_binary(binding_.filter(), data, len, qos, retain);
     }
 
-    [[nodiscard]] const std::string& name() const noexcept { return topic_; }
-    [[nodiscard]] int                qos() const noexcept { return qos_; }
+    [[nodiscard]] const std::string& name() const noexcept { return binding_.filter(); }
+    [[nodiscard]] int                qos() const noexcept { return binding_.qos(); }
     [[nodiscard]] MqttClient&        client() const { return require_client(); }
 
     /// 仅成员函数模式可用；可调用对象模式没有可返回的 Svc 对象。
@@ -167,12 +154,10 @@ private:
         return svc_;
     }
 
-    MqttClient* cli_{nullptr};
-    std::string topic_;
-    Handler     handler_;
-    Svc*        svc_{nullptr};   ///< 仅成员函数模式；可调用对象模式为 nullptr
-    int         qos_{-1};
-    std::uint64_t slot_{0};
+    MqttClient*               cli_{nullptr};
+    Binding                   binding_;
+    std::optional<Subscription> sub_;
+    Svc*                      svc_{nullptr};  ///< 仅成员函数模式；可调用对象模式为 nullptr
 };
 
 using TopicFn = Topic<std::function<void(const MessageView&)>, nullptr>;

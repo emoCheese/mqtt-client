@@ -12,6 +12,7 @@ add_library(mqtt_client STATIC
     topic_directory.hpp
     topic.hpp
     handler.hpp
+    binding.hpp
     message.hpp
     imqtt_client.h
 )
