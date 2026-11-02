@@ -8,8 +8,11 @@
 | 结构 | 拥有者 | 生命周期 | 备注 |
 | --- | --- | --- | --- |
 | `MqttClient` | 应用 | 最长（不要晚于其 Session/service） | 不可拷贝不可移动 |
-| `Topic<Svc, M>` | 应用（通常作为 Session 成员） | 由应用决定；析构即摘除注册 | 可 move，不可拷贝 |
-| 业务 service 对象 | 应用 | **必须长于**引用它的 Topic（见 `05` 成员顺序约定） | 库不持有 |
+| `Binding` | 应用（纯值） | 由应用决定 | 可复制；构造期校验，不产生注册 |
+| `Subscription` | 应用（通常作为 Session 成员） | 由应用决定；析构即摘除注册 | 只移动；move 只搬运 slot |
+| `Topic<Svc, M>` | 应用（兼容门面） | 由应用决定；析构即摘除注册 | 内部是 `Binding + Subscription` |
+| `Handler` | `Subscription` 描述符 / 目录 `Slot` | 注册后不可变 | 成员模式零分配；可调用模式一次分配 |
+| 业务 service 对象 | 应用 | **必须长于**引用它的 Subscription/Binding（见 `05` 成员顺序约定） | 库不持有 |
 | `Slot` | `TopicDirectory`（`by_slot_` + `dir_` 各持一份 `shared_ptr`） | 最后一个引用消失时 | 也被 `Lease` 持有 |
 | `Lease` | 由 handler 调用产生的 `MessageView` 副本共享 | 最后一份副本消失时 | 每次调用一份 |
 | `mqtt::message` | paho 与 `KeepAlive` | 最后一个 `const_message_ptr` 消失时 | 视图借用它的内部 buffer |
@@ -48,10 +51,10 @@ struct MqttConfig {                    // mqtt_client.hpp
 ```cpp
 struct Slot {                          // 一次 install = 一个 Slot（目录内部）
     std::uint64_t      slot;           // 句柄 id，单调递增，永不复用
-    std::atomic<void*> obj;            // 目标对象（Topic 句柄本体）；move 时被 rebind 改写
-    InvokeFn           fn;             // 编译期 thunk：void(*)(void*, const MessageView&)
+    Handler            handler;        // 注册后不可变：成员 {Svc*, thunk} 或 callable state
+    int                qos;            // 该 handler 的生效 QoS（由 mtx_ 保护）
     std::atomic<bool>  alive;          // false ⇒ 已被摘除，同批后续不再进入
-    std::atomic<int>   inflight;       // 正在执行 h->fn(...) 的调用帧数
+    std::atomic<int>   inflight;       // 正在执行 h->handler(...) 的调用帧数
     std::atomic<int>   async_refs;     // 外部仍持有的保活凭据份数（= 存活的 Lease 数）
 };
 
@@ -117,23 +120,39 @@ struct MessageView {
 2. **输出**：`TopicDirectory::dispatch` 为每次 handler 调用**换入新的凭据**
    （持有消息 + 该 handler 的 `Slot`），于是"拷贝视图"就自动等价于"声明我还在使用"。
 
-## 2.5 用户层：`Topic<Svc, M>`
+## 2.5 用户层：`Handler` / `Binding` / `Subscription`
 
 ```cpp
-template <typename Svc, auto M = nullptr> class Topic;
+// handler.hpp
+class Handler {                        // 类型擦除后的处理器，注册后不可变
+    void* target_;                     // Svc*，或 callable State<F>*
+    void (*fn_)(void*, const MessageView&);  // 静态 thunk
+    std::shared_ptr<void> owner_;      // 仅可调用模式：保持 State<F> 存活
+};
 
-MqttClient*   cli_;        // nullptr ⇒ 已被 move（此时 open/publish/client 会拒绝或抛错）
-std::string   topic_;      // topic filter（可含 + / #）
-Svc*          svc_;        // 处理者：成员函数模式下指向外部对象；拥有型模式下指向 owned_
-unique_ptr<Svc> owned_;    // 仅"可调用对象"模式使用
-int           qos_;        // -1 ⇒ 用 MqttClient 的默认 QoS
-uint64_t      slot_;       // 0 ⇒ 未注册
+// binding.hpp
+class Binding {                        // 纯描述符，无副作用
+    std::string filter_;               // 非空；可含 + / #
+    Handler     handler_;              // valid() 必须为 true
+    int         qos_;                  // [-1, 2]；-1 ⇒ 用 MqttClient 默认值
+    Subscription open(MqttClient&) const;  // 每次产生独立注册
+};
+
+class Subscription {                   // 激活凭据，只移动
+    MqttClient*   cli_;                // move 后置空
+    uint64_t      slot_;               // 0 ⇒ 已关闭/已 move
+    std::string   filter_;
+    int           qos_;                // 请求值；effective_qos() 查询实际值
+};
 ```
 
-成员函数由模板参数 `M` 在编译期确定：`M != nullptr` 时 `invoke()` 直接调用
-`(svc_->*M)(msg)`（const 成员函数则经 `const Svc*`），没有运行时分支或间接调用；
-`M == nullptr` 时使用拥有型可调用对象，并以
-`if constexpr (std::is_invocable_v<Svc&, const MessageView&>)` 做编译期裁剪。
+- `Binding` 在构造期完成全部校验；`open()` 只做分配与登记，可重复调用（多播）。
+- `Subscription` 构造私有，只能由 `Binding::open()` 产生；析构/`close()` 退订。
+- 成员函数由 `Handler::member<Svc, M>` 的 `M` 在编译期确定；thunk 内直接调用
+  `(svc->*M)(msg)`（const 成员函数经 `const Svc*`）。可调用对象由
+  `Handler::callable` 存进 `State<F>`，调用时仅一次间接跳转。
+- `Topic<Svc, M>` 只是 `Binding + std::optional<Subscription>` 的兼容门面，
+  不再持有 `slot_`/`owned_`/`svc_` 的状态机；可调用模式没有 `service()`。
 
 ## 2.6 不变式清单
 
@@ -144,7 +163,7 @@ uint64_t      slot_;       // 0 ⇒ 未注册
 | **I1** | **[锁]** `dir_` 中每个 `Entry.handlers` 里的 `SlotPtr` 非空，且同一个 `Slot` 只属于一个 `Entry` | 同一 handler 被重复调用 / 计数错乱 |
 | **I2** | **[锁]** `by_slot_[id]` 存在 ⟺ 对应 `Slot` 在 `dir_[Record.topic].handlers` 中 | `remove` 找不到目标 → 泄漏或 UAF |
 | **I3** | **[锁]** `wild_filters_` 无重复，且 `f ∈ wild_filters_` ⟺ `is_wildcard_filter(f) && dir_.count(f)` | 通配 filter 漏派发或重复派发 |
-| **I4** | **[锁]** `dir_[f].qos == max(该 filter 下所有 handler 的注册 qos)`，且只增不减直到该 filter 清空 | 订阅 QoS 低于 handler 期望 |
+| **I4** | **[锁]** `dir_[f].qos == max(该 filter 下所有 handler 的 qos)`；`add` / `set_qos` / `remove` 后都必须重算，变化时返回 `subscribe/resubscribe` | 订阅 QoS 低于 handler 期望，或残留过高的 QoS |
 | **I5** | `alive == false` ⇒ 该 slot 已不在 `dir_`/`by_slot_` 中（摘除时先在锁内 `alive=false` 再 erase） | 同批派发进入已摘除的 handler |
 | **I6** | 被 `dispatch` 收进批次的 slot，其 `inflight` 自增**先于** `remove` 的 erase 可见（两者都在各自锁内完成） | `remove` 提前返回 → UAF |
 | **I7** | `remove` 只在 `inflight == 0 && async_refs == 0` 时返回（自等豁免见 I10） | 目标对象在异步任务仍在使用时被析构 |
@@ -154,8 +173,10 @@ uint64_t      slot_;       // 0 ⇒ 未注册
 | **I11** | `next_slot_` 单调递增，slot id 永不复用 | 陈旧句柄误命中新注册 |
 | **I12** | **[session_mtx_]** `session_subs_ ⊆ {dir_ 中的 filter}`；只在本进程成功连过之后才作为"可信差异基线" | 漏订阅或重复订阅（重复触发 retained） |
 | **I13** | 生产路径中 `dispatch` 仅由消费线程调用（`TopicDirectory` 本身支持并发 dispatch，但 `MqttClient` 不这么做） | 不再是"单派发者"，`t_active_slot` 语义变复杂 |
-| **I14** | 调用 `h->fn(...)` 时**不得**持有 `mtx_` 或 `session_mtx_` | 回调内注册/摘除死锁 |
-| **I15** | `Topic::slot_ != 0` ⟺ 已注册；`cli_ == nullptr` ⟺ 已被 move | move 后误用 → 空指针 / 双重摘除 |
+| **I14** | 调用 `h->handler(...)` 时**不得**持有 `mtx_` 或 `session_mtx_` | 回调内注册/摘除死锁 |
+| **I15** | `Subscription::slot_ != 0` ⟺ 已注册；move 后源对象 `slot_ == 0`、`cli_ == nullptr` | move 后误用 → 双重摘除 / 空指针 |
+| **I16** | `Slot::handler` 注册后不可变；目录从不保存指向用户句柄（`Topic`/`Subscription`）的指针 | move 后目录悬垂；这也消除了 `rebind` 的需求 |
+| **I17** | `Binding::open()` 只复制/共享 `Handler`；可调用模式的 `State<F>` 由 `shared_ptr` 保活 | 描述符析构后回调悬垂 |
 
 ## 2.7 已知开销与可选优化（技术储备）
 
@@ -165,7 +186,7 @@ uint64_t      slot_;       // 0 ⇒ 未注册
 | --- | --- | --- |
 | `std::vector<SlotPtr> batch` 扩容 | 每条消息 1 次 | 可改为"消费线程私有 + 复用"的 `thread_local` 缓冲（I13 保证只有一个派发者时安全） |
 | `make_shared<Lease>` | **每个 handler 调用 1 次** | 保活协议的代价；若明确禁止异步，可整段删除（见 `06` 的裁剪建议） |
-| `atomic` RMW | 每 handler 4~6 次 | `alive` 读、`inflight` ±1、`async_refs` ±1 |
+| `atomic` RMW | 每 handler 4 次 | `alive` 读、`inflight` ±1、`async_refs` ±1（不再有 `obj` 读取） |
 | `shared_ptr` 引用计数 | 每 handler 数次 | 快照 + 凭据共享 |
 | 锁 | 每条消息 1 次 `shared_lock` | 与其他线程的注册/摘除互斥 |
 

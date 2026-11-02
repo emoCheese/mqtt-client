@@ -9,18 +9,18 @@
 | 对象 | 谁拥有 | 何时死亡 | 库能否观测 |
 | --- | --- | --- | --- |
 | `mqtt::message`（payload/topic/props 的真实载体） | paho + 消费循环里的 `const_message_ptr` | 本轮消费循环迭代结束 | ✅ |
-| handler **调用帧** | 消费线程栈 | `h->fn(...)` 返回 | ✅（`inflight`） |
+| handler **调用帧** | 消费线程栈 | `h->handler(...)` 返回 | ✅（`inflight`） |
 | handler **派生出的异步任务** | 用户线程池 | 未知 | ❌（只能靠用户传递的凭据） |
-| `Topic` / 业务 service | 应用 | 应用决定 | ❌（库只持有裸 `void*`） |
+| `Subscription` / 业务 service | 应用 | 应用决定 | ❌（库只持有裸 `Svc*`，由用户保证寿命） |
 
-`MessageView` 的三个视图字段是**借用**的（零拷贝的代价），目录里的 `obj` 是**裸指针**
+`MessageView` 的三个视图字段是**借用**的（零拷贝的代价），`Handler` 的成员模式保存一个**裸 `Svc*`**
 （类型擦除与零开销多态的代价）。两者叠加"未知时刻"的异步任务，就必须有一个
 **跨线程、可传递、库可观测**的信号来界定"什么时候才算真的没人用了"。
 
 ## 5.2 为什么 `inflight` 一个计数器不够
 
 ```
-[消费线程]  h->fn(obj, msg) ──► pool.post(...) ──► return
+[消费线程]  h->handler(msg) ──► pool.post(...) ──► return
                   │                                    │
             inflight = 1                          inflight = 0   ← 调用帧结束
                                                        │
@@ -122,7 +122,7 @@ pool.post([ka = m.keep_alive, payload = std::string{m.payload}, this] { use(payl
 
 - 只要 `Owned` 活着，数据永远有效（与凭据无关）；
 - `Owned` 仍带 `keep_alive`，用于**保护登记项/业务对象**；
-- 若你只是想把数据缓存下来、不想因此拖住 `Topic` 的析构，
+- 若你只是想把数据缓存下来、不想因此拖住 `Subscription` 的析构，
   可以显式 `owned.keep_alive.reset()`（数据不受影响，因为它本来就是自己的）。
 
 ## 5.6 自等豁免（R3）与它的代价
@@ -131,23 +131,32 @@ pool.post([ka = m.keep_alive, payload = std::string{m.payload}, this] { use(payl
 
 - **为什么必须豁免**：此时调用帧就是当前线程自己，等待等于自等 → 必然死锁；
 - **代价**：该场景下不提供异步保护。这在语义上本就自相矛盾
-  （"我正在销毁这个 Topic，同时我派生的任务还要用它"）。库选择"宁可不管，也绝不死锁"；
+  （"我正在销毁这个订阅，同时我派生的任务还要用它"）。库选择"宁可不管，也绝不死锁"；
 - 注意：豁免只影响**该 slot**；同一批次里其它 slot 的计数照常归还。
 
 > 相关用例：`directory_self_removal_inside_handler_does_not_deadlock`。
 
 ## 5.7 Session 成员顺序约定（容易踩的坑）
 
-```
+```cpp
 class Session {
-    RobotService            svc_;      // ① 先声明 → 后析构
-    mqttx::Topic<RobotService, &RobotService::on_cmd>    cmd_;  // ② 后声明 → 先析构
-    mqttx::Topic<RobotService, &RobotService::on_status> st_;
+    RobotService             svc_;      // ① 先声明 → 后析构
+    int                      alarms_{0};// ② 回调/异步会访问
+    mqttx::SubscriptionGroup group_;    // ③ 后声明 → 先析构（等待在飞 handler）
+
+public:
+    explicit Session(MqttClient& cli) {
+        group_.add(mqttx::make_binding<&RobotService::on_cmd>("robot/+/cmd", svc_, 1));
+        group_.add(mqttx::make_binding("robot/alarm", [this](const MessageView&) {
+            ++alarms_;
+        }, 2));
+        group_.open_all(cli);           // 所有成员构造完成后才激活
+    }
 };
 ```
 
-C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `cmd_/st_`（`remove` 等待异步任务释放凭据），
-再析构 `svc_`。**顺序反了就会出现"Topic 已等到异步完成、但 service 早被销毁"的假安全。**
+C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `group_`（`remove` 等待异步任务释放凭据），
+再析构 `alarms_` 与 `svc_`。**顺序反了就会出现"订阅已等到异步完成、但 service 早被销毁"的假安全。**
 
 > 示例见 [`../examples/topic_demo.cpp`](../examples/topic_demo.cpp) 的 `RobotSession` 与 `demo_async()`。
 
@@ -159,7 +168,7 @@ C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `cmd_/st_`（`re
 | **teardown 可能被长任务拖住** | 异步任务持有凭据期间，`close()`/析构会阻塞 | 让任务有明确上界；或在不需要保护时用 `keep_alive.reset()` |
 | **消息被延长持有** | 凭据持有 `const_message_ptr`，异步期间消息不会归还 paho | 正常（这正是目的）；避免把视图长期缓存 |
 | **自析构 + 异步** | 5.6 的豁免场景无保护 | 不要写这种代码；需要就改成"先投递、再让别的线程 close" |
-| **同一 `Topic` 跨线程 move** | `Topic` 是普通对象，move 不是原子的 | 由调用方保证：move 只在单线程进行 |
+| **同一 `Subscription` 跨线程 move/close** | 它是普通对象，操作不是原子的 | 由调用方保证：move/open/close 只在单线程进行 |
 | **重启客户端** | handler 内 `stop()` 后立刻 `start()` 可能触发自 join | 见 [`03-thread-model.md`](03-thread-model.md) §3.7 |
 | **paho 版本依赖** | 消费事件 API 在 paho ≥1.5 才是指针重载 | 升级 paho 时复查 `consume_loop` 的事件处理分支 |
 
@@ -185,7 +194,7 @@ C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `cmd_/st_`（`re
 | 自等豁免（R3） | `directory_self_removal_inside_handler_does_not_deadlock` | 无豁免会挂死，由 ctest 超时兜底 |
 | 异常隔离 | `directory_handler_exception_is_isolated` | 抛异常的 handler 不影响同批 |
 | 并发 add/remove/dispatch | `directory_concurrent_add_remove_dispatch` | ASan / TSan 下运行 |
-| move 后 rebind（I15） | `topic_move_ctor_rebinds_registration`、`topic_move_assignment_rebinds_registration`、`topic_moved_from_object_is_inert` | |
+| move 保留注册、无 rebind（I15/I16） | `topic_move_ctor_preserves_registration`、`topic_move_assignment_preserves_registration`、`topic_moved_from_object_is_inert`、`subscription_move_preserves_registration` | |
 | 重连只补差异订阅（I12） | 端到端测试的 `SUBSCRIBE` 次数断言（`mock_broker.py` 日志） | 首次连接全量、连接事件不重复订阅 |
 | 端到端（真实 socket + 消费线程） | `mqttx_online`（[`../tests/integration/test_online.cpp`](../tests/integration/test_online.cpp)） | 含异步 handler 读回载荷 |
 

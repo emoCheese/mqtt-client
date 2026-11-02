@@ -21,6 +21,7 @@
 //        - 若在 handler 内部摘除自己（自析构场景），不会自等死锁。
 // ---------------------------------------------------------------------------
 
+#include "handler.hpp"
 #include "message.hpp"
 
 #include <atomic>
@@ -56,9 +57,6 @@ struct SvEqual {
 /// 以 topic 为核心的回调目录（线程安全）
 class TopicDirectory {
 public:
-    /// handler 的统一调用形式（编译期生成的 thunk，零额外分配）
-    using InvokeFn = void (*)(void* obj, const MessageView& msg);
-
     /// add() 的结果：调用方可据此决定是否发送 SUBSCRIBE
     struct InstallResult {
         std::uint64_t slot{0};       ///< 本次注册的句柄，交给 remove()
@@ -66,11 +64,21 @@ public:
         int           qos{0};        ///< 该 topic 当前生效的 QoS
     };
 
-    /// remove() 的结果：调用方可据此决定是否发送 UNSUBSCRIBE
+    /// remove() 的结果：调用方可据此决定是否发送 UNSUBSCRIBE / 重新 SUBSCRIBE
     struct RemoveResult {
         bool        removed{false};      ///< 是否真的摘除了一个登记项
         bool        unsubscribe{false};  ///< true = 该 topic 已无 handler，需 UNSUBSCRIBE
+        bool        resubscribe{false};  ///< true = 剩余 handler 的最大 QoS 变了，需重新 SUBSCRIBE
+        int         qos{0};              ///< 剩余 handler 的最大 QoS
         std::string topic;               ///< 被摘除登记项所属的 topic
+    };
+
+    /// set_qos() 的结果
+    struct QosResult {
+        bool        found{false};        ///< slot 是否存在
+        bool        resubscribe{false};  ///< true = 该 topic 的最大 QoS 变了
+        int         qos{0};              ///< 该 topic 当前生效的 QoS
+        std::string topic;
     };
 
     /// 供 subscribe_all() 使用的快照项
@@ -88,8 +96,8 @@ public:
 
     /// 注册一个 handler。topic 为 topic filter（可含 '+' / '#'），
     /// qos 为已解析好的有效 QoS（不接受负值）。
-    /// @throw std::invalid_argument topic 为空或 fn 为空
-    InstallResult add(std::string_view topic, void* obj, InvokeFn fn, int qos);
+    /// @throw std::invalid_argument topic 为空或 handler 无效
+    InstallResult add(std::string_view topic, Handler handler, int qos);
 
     /// 摘除 slot 对应的 handler；必要时阻塞，直到
     ///   1) 该 handler 的在飞调用返回，且
@@ -97,8 +105,12 @@ public:
     /// @note 幂等：未知 slot 返回 removed=false。
     RemoveResult remove(std::uint64_t slot);
 
-    /// handler 对象被移动后更新其指针；成功返回 true。
-    bool rebind(std::uint64_t slot, void* obj) noexcept;
+    /// 更新某个 handler 的 QoS，并按剩余 handler 的最大值决定是否重新订阅。
+    /// @note 不改变 slot；未知 slot 返回 found=false。
+    QosResult set_qos(std::uint64_t slot, int qos);
+
+    /// 某个 slot 当前生效的 QoS；未知返回 -1。
+    [[nodiscard]] int qos_of(std::uint64_t slot) const;
 
     /// 把消息派发给所有匹配 topic 的 handler，返回实际调用的 handler 数。
     ///
@@ -125,8 +137,8 @@ private:
     /// 一次注册（一个 Topic 对象）对应的登记项
     struct Slot {
         std::uint64_t      slot{0};
-        std::atomic<void*> obj{nullptr};
-        InvokeFn           fn{nullptr};
+        Handler            handler;        ///< 注册后不可变，无需 rebind
+        int                qos{0};         ///< 该 handler 请求的生效 QoS（由目录锁保护）
         std::atomic<bool>  alive{true};
         std::atomic<int>   inflight{0};    ///< 正在执行该 handler 调用的线程数
         std::atomic<int>   async_refs{0};  ///< 外部仍持有的保活凭据份数

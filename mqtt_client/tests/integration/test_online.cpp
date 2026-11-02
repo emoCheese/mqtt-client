@@ -122,11 +122,11 @@ int main(int argc, char** argv) {
     auto async_topic = make_topic(cli, "it/async",
                                   [&pool](const MessageView& m) { pool.post(m); }, 1);
 
-    exact.open();
-    plus.open();
-    hash.open();
-    idle.open();
-    async_topic.open();
+    (void)exact.open();
+    (void)plus.open();
+    (void)hash.open();
+    (void)idle.open();
+    (void)async_topic.open();
 
     check(cli.topic_count() == 5, "注册了 5 个 topic filter");
 

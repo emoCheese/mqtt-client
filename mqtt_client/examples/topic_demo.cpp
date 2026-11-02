@@ -5,14 +5,16 @@
 //   ./mqttx_topic_demo tcp://127.0.0.1:1883   # 在线演示：真连 broker 收发
 // ---------------------------------------------------------------------------
 
+#include "binding.hpp"
 #include "mqtt_client.hpp"
-#include "topic.hpp"
+#include "publisher.hpp"
 
 #include <spdlog/spdlog.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <stdexcept>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -49,20 +51,25 @@ private:
     int status_{0};
 };
 
-/// Session：把 client 与一组 Topic 组合起来，构造体末尾统一 open()
+/// Session：service 先构造，再用 Binding + SubscriptionGroup 批量激活。
+///
+/// 成员顺序即析构顺序（逆序）：group_ 最后声明 → 最先析构，先等待在飞 handler，
+/// 然后才析构 alarms_ 与 svc_，避免异步任务访问已销毁的业务对象。
 class RobotSession {
 public:
-    explicit RobotSession(MqttClient& cli)
-        : cmd_{mqttx::make_topic<&RobotService::on_cmd>(cli, "robot/+/cmd", svc_, 1)}
-        , status_{mqttx::make_topic<&RobotService::on_status>(cli, "robot/+/status", svc_, 0)}
-        , alarm_{mqttx::make_topic(cli, "robot/alarm", [this](const MessageView& m) {
-              std::cout << "  [alarm]  payload=" << m.payload << '\n';
-              ++alarms_;
-          }, 2)} {
-        // Topic 构造完成后才注册，避免构造期把 this 交给其它线程
-        cmd_.open();
-        status_.open();
-        alarm_.open();
+    explicit RobotSession(MqttClient& cli) {
+        group_.add(mqttx::make_binding<&RobotService::on_cmd>("robot/+/cmd", svc_, 1));
+        group_.add(mqttx::make_binding<&RobotService::on_status>("robot/+/status", svc_, 0));
+        group_.add(mqttx::make_binding(
+            "robot/alarm",
+            [this](const MessageView& m) {
+                std::cout << "  [alarm]  payload=" << m.payload << '\n';
+                ++alarms_;
+            },
+            2));
+
+        // 所有成员构造完成后才激活，避免构造期把 this 交给消费线程
+        group_.open_all(cli);
     }
 
     RobotSession(const RobotSession&)            = delete;
@@ -73,11 +80,9 @@ public:
     int status() const { return svc_.status(); }
 
 private:
-    RobotService                     svc_;
-    mqttx::Topic<RobotService, &RobotService::on_cmd>    cmd_;
-    mqttx::Topic<RobotService, &RobotService::on_status> status_;
-    mqttx::TopicFn                                       alarm_;  ///< 可调用对象形式
-    int                              alarms_{0};
+    RobotService             svc_;      ///< 必须先于 group_ 构造、晚于 group_ 析构
+    int                      alarms_{0};///< 异步/回调可访问，必须在 group_ 之前声明
+    mqttx::SubscriptionGroup group_;    ///< 析构时关闭全部并等待在飞 handler
 };
 
 void dump_directory(const MqttClient& cli) {
@@ -112,6 +117,65 @@ void demo_offline() {
               << " alarm=" << session.alarms() << " topic数=" << cli.topic_count() << '\n';
 }
 
+/// 新 API 演示：Binding / Subscription / SubscriptionGroup / Publisher
+void demo_bindings() {
+    std::cout << "\n== Binding / Subscription / Publisher 演示 ==\n";
+
+    MqttConfig cfg;
+    cfg.broker_url = "tcp://127.0.0.1:1883";
+    cfg.client_id  = "mqttx-demo-bindings";
+    MqttClient cli{cfg};
+
+    RobotService svc;
+    int          lambda_hits = 0;
+    int          group_hits  = 0;
+
+    // 两步式：描述符可在构造期安全创建，完全构造后再激活
+    auto cmd_binding = mqttx::make_binding<&RobotService::on_cmd>("bind/+/cmd", svc, 1);
+    auto member      = cmd_binding.open(cli);
+
+    // 一步式：适合已完全构造的对象
+    auto lambda = mqttx::subscribe(cli, "bind/lambda",
+                                   [&lambda_hits](const MessageView&) { ++lambda_hits; }, 1);
+
+    // Subscription 只移动：move 后源对象失活，注册仍有效
+    auto moved_lambda = std::move(lambda);
+    std::cout << "  lambda.active=" << lambda.active() << " moved.active=" << moved_lambda.active()
+              << '\n';
+
+    // QoS 目录级更新：slot 不变，不产生退订/重订窗口
+    (void)member.set_qos(2);
+
+    // 批量订阅：open_all 失败会回滚；析构关闭全部
+    mqttx::SubscriptionGroup group;
+    group.add(mqttx::make_binding("bind/g1", [&group_hits](const MessageView&) { ++group_hits; }, 0));
+    group.add(mqttx::make_binding("bind/g2", [&group_hits](const MessageView&) { ++group_hits; }, 1));
+    group.open_all(cli);
+
+    // 发布是独立的值对象；构造期即拒绝 +/#
+    mqttx::Publisher pub{cli, "bind/1/cmd", 1};
+    std::cout << "  Publisher topic=" << pub.topic() << " qos=" << pub.qos()
+              << "（离线模式不实际 publish）\n";
+
+    try {
+        mqttx::Publisher bad{cli, "bind/+/cmd"};
+        (void)bad;
+    }
+    catch (const std::invalid_argument& e) {
+        std::cout << "  Publisher 拒绝通配符: " << e.what() << '\n';
+    }
+
+    cli.dispatch("bind/1/cmd", msg("bind/1/cmd", R"({"v":1})", 1));
+    cli.dispatch("bind/lambda", msg("bind/lambda", "x", 1));
+    cli.dispatch("bind/g1", msg("bind/g1", "x", 0));
+    cli.dispatch("bind/g2", msg("bind/g2", "x", 1));
+
+    std::cout << "  member.cmds=" << svc.cmds() << " lambda=" << lambda_hits
+              << " group=" << group_hits
+              << " requested_qos=" << member.qos()
+              << " effective_qos=" << member.effective_qos() << '\n';
+}
+
 /// 在线演示：连接 broker，订阅后再发布，最后优雅退出
 void demo_online(const std::string& broker_url) {
     std::cout << "\n== 在线演示（broker=" << broker_url << "）==\n";
@@ -132,9 +196,14 @@ void demo_online(const std::string& broker_url) {
         return;
     }
 
-    cli.publish("robot/7/cmd", R"({"v":0.5})");
-    cli.publish("robot/7/status", "busy");
-    cli.publish("robot/alarm", "low-battery", 2, /*retain=*/true);
+    // 发布与订阅解耦：每个具体 topic 一个 Publisher
+    mqttx::Publisher cmd_pub{cli, "robot/7/cmd", 1};
+    mqttx::Publisher status_pub{cli, "robot/7/status", 0};
+    mqttx::Publisher alarm_pub{cli, "robot/alarm", 2, /*retain=*/true};
+
+    cmd_pub.publish(R"({"v":0.5})");
+    status_pub.publish("busy");
+    alarm_pub.publish("low-battery");
 
     std::this_thread::sleep_for(std::chrono::milliseconds(500));  // 等消息回环
 
@@ -158,11 +227,11 @@ void demo_async() {
     std::vector<std::thread> workers;
     std::atomic<int>         good{0};
 
-    auto topic = mqttx::make_topic(cli, "robot/+/telemetry", [&](const MessageView& m) {
+    auto sub = mqttx::subscribe(cli, "robot/+/telemetry", [&](const MessageView& m) {
         // 关键：按值捕获整个 MessageView（含保活凭据）。
         // 派发帧立刻返回，但凭据会一直有效到本任务结束：
         //   - m.topic / m.payload 仍然指向有效的消息数据；
-        //   - 该 Topic 在此期间不会被析构（close()/析构会等待）。
+        //   - 该 Subscription 在此期间不会被回收（close()/析构会等待）。
         std::lock_guard lk{mtx};
         workers.emplace_back([copy = m, &good] {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));  // 模拟耗时处理
@@ -170,12 +239,11 @@ void demo_async() {
         });
     }, 0);
 
-    topic.open();
     cli.dispatch("robot/3/telemetry", msg("robot/3/telemetry", "42", 0));
     std::this_thread::sleep_for(std::chrono::milliseconds(50));  // 让 worker 先跑起来
 
     const auto t0 = std::chrono::steady_clock::now();
-    topic.close();  // 会等待异步任务释放凭据，而不是立刻回收
+    sub.close();  // 会等待异步任务释放凭据，而不是立刻回收
     const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
                             std::chrono::steady_clock::now() - t0)
                             .count();
@@ -195,6 +263,7 @@ int main(int argc, char** argv) {
     spdlog::set_level(spdlog::level::info);
 
     demo_offline();
+    demo_bindings();
     demo_async();
 
     if (argc > 1) demo_online(argv[1]);

@@ -7,3 +7,4 @@ build*/
 .mplcache/
 benchmark/
 dispatch_bench/
+.codebase-memory/

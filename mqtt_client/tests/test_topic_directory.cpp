@@ -26,29 +26,35 @@ struct Sink {
     std::atomic<int> count{0};
     std::string      last_topic;
     std::string      last_payload;
+
+    void on(const MessageView& msg) {
+        count.fetch_add(1, std::memory_order_relaxed);
+        last_topic.assign(msg.topic);
+        last_payload.assign(msg.payload);
+    }
 };
 
-void sink_fn(void* obj, const MessageView& msg) {
-    auto* s = static_cast<Sink*>(obj);
-    s->count.fetch_add(1, std::memory_order_relaxed);
-    s->last_topic.assign(msg.topic);
-    s->last_payload.assign(msg.payload);
-}
+Handler sink_handler(Sink& s) { return Handler::member<Sink, &Sink::on>(s); }
 
-void throwing_fn(void*, const MessageView&) { throw std::runtime_error("handler boom"); }
+struct Thrower {
+    void on(const MessageView&) { throw std::runtime_error("handler boom"); }
+};
+
+Handler throwing_handler(Thrower& t) { return Handler::member<Thrower, &Thrower::on>(t); }
 
 /// 模拟“在回调里析构自己”：handler 内部摘除自己的 slot
 struct SelfRemover {
     TopicDirectory* dir{nullptr};
     std::uint64_t   slot{0};
     int             calls{0};
+
+    void on(const MessageView&) {
+        ++calls;
+        dir->remove(slot);
+    }
 };
 
-void self_remove_fn(void* obj, const MessageView&) {
-    auto* s = static_cast<SelfRemover*>(obj);
-    ++s->calls;
-    s->dir->remove(s->slot);
-}
+Handler self_handler(SelfRemover& r) { return Handler::member<SelfRemover, &SelfRemover::on>(r); }
 
 }  // namespace
 
@@ -58,7 +64,7 @@ TEST(directory_add_new_topic_requests_subscribe) {
     TopicDirectory dir;
     Sink           a;
 
-    const auto res = dir.add("robot/1/cmd", &a, sink_fn, 1);
+    const auto res = dir.add("robot/1/cmd", sink_handler(a), 1);
 
     CHECK(res.slot != 0);
     CHECK(res.subscribe);
@@ -73,15 +79,15 @@ TEST(directory_add_empty_topic_or_null_handler_throws) {
     TopicDirectory dir;
     Sink           a;
 
-    CHECK_THROWS_AS(dir.add("", &a, sink_fn, 1), std::invalid_argument);
-    CHECK_THROWS_AS(dir.add("t", &a, nullptr, 1), std::invalid_argument);
+    CHECK_THROWS_AS(dir.add("", sink_handler(a), 1), std::invalid_argument);
+    CHECK_THROWS_AS(dir.add("t", Handler{}, 1), std::invalid_argument);
 }
 
 TEST(directory_dispatch_reaches_handler) {
     TopicDirectory dir;
     Sink           a;
 
-    const auto res = dir.add("robot/1/cmd", &a, sink_fn, 1);
+    const auto res = dir.add("robot/1/cmd", sink_handler(a), 1);
     const auto n   = dir.dispatch("robot/1/cmd", make_view("robot/1/cmd", "hello"));
 
     CHECK_EQ(n, std::size_t{1});
@@ -101,8 +107,8 @@ TEST(directory_multicast_same_topic) {
     Sink           a;
     Sink           b;
 
-    const auto sa = dir.add("evt", &a, sink_fn, 1);
-    const auto sb = dir.add("evt", &b, sink_fn, 1);
+    const auto sa = dir.add("evt", sink_handler(a), 1);
+    const auto sb = dir.add("evt", sink_handler(b), 1);
 
     CHECK_FALSE(sb.subscribe);  // 已有订阅者：无需重复 SUBSCRIBE
     CHECK_EQ(dir.topic_count(), std::size_t{1});
@@ -137,7 +143,7 @@ TEST(directory_remove_unknown_slot_is_noop) {
     CHECK_FALSE(r.unsubscribe);
 
     Sink       a;
-    const auto s = dir.add("t", &a, sink_fn, 1);
+    const auto s = dir.add("t", sink_handler(a), 1);
     dir.remove(s.slot);
     CHECK_FALSE(dir.remove(s.slot).removed);  // 幂等
 }
@@ -147,13 +153,13 @@ TEST(directory_qos_is_max_of_handlers) {
     Sink           a;
     Sink           b;
 
-    CHECK_EQ(dir.add("t", &a, sink_fn, 0).qos, 0);
-    const auto hi = dir.add("t", &b, sink_fn, 2);
+    CHECK_EQ(dir.add("t", sink_handler(a), 0).qos, 0);
+    const auto hi = dir.add("t", sink_handler(b), 2);
     CHECK_EQ(hi.qos, 2);
     CHECK(hi.subscribe);  // QoS 提升 → 需要按更高 QoS 重新 SUBSCRIBE
 
     Sink       c;
-    const auto lo = dir.add("t", &c, sink_fn, 1);
+    const auto lo = dir.add("t", sink_handler(c), 1);
     CHECK_EQ(lo.qos, 2);
     CHECK_FALSE(lo.subscribe);  // QoS 未提升 → 不必重订阅
 
@@ -161,29 +167,55 @@ TEST(directory_qos_is_max_of_handlers) {
     CHECK_EQ(subs.size(), std::size_t{1});
     CHECK_EQ(subs.at(0).topic, std::string{"t"});
     CHECK_EQ(subs.at(0).qos, 2);
+
+    // 摘除 QoS=2 的 handler：剩余最大 QoS 降为 1，需要按新 QoS 重订
+    const auto removed = dir.remove(hi.slot);
+    CHECK(removed.removed);
+    CHECK_FALSE(removed.unsubscribe);
+    CHECK(removed.resubscribe);
+    CHECK_EQ(removed.qos, 1);
+    CHECK_EQ(dir.subscriptions().at(0).qos, 1);
 }
 
-TEST(directory_rebind_updates_target) {
+TEST(directory_set_qos_recomputes_max) {
     TopicDirectory dir;
     Sink           a;
     Sink           b;
 
-    const auto s = dir.add("t", &a, sink_fn, 1);
-    CHECK(dir.rebind(s.slot, &b));
-    CHECK_EQ(dir.dispatch("t", make_view("t", "x")), std::size_t{1});
-    CHECK_EQ(a.count.load(), 0);
-    CHECK_EQ(b.count.load(), 1);
+    const auto sa = dir.add("t", sink_handler(a), 0);
+    const auto sb = dir.add("t", sink_handler(b), 2);
 
-    CHECK_FALSE(dir.rebind(9999, &a));  // 未知 slot
+    // 0 -> 2：最大值仍是 2，不需要重订
+    auto q = dir.set_qos(sa.slot, 2);
+    CHECK(q.found);
+    CHECK_FALSE(q.resubscribe);
+    CHECK_EQ(q.qos, 2);
+    CHECK_EQ(dir.qos_of(sa.slot), 2);
+
+    // 2 -> 0：另一个仍是 2，不需要重订
+    q = dir.set_qos(sb.slot, 0);
+    CHECK(q.found);
+    CHECK_FALSE(q.resubscribe);
+    CHECK_EQ(q.qos, 2);
+
+    // 最后一个 2 -> 0：最大值下降，需要重订
+    q = dir.set_qos(sa.slot, 0);
+    CHECK(q.found);
+    CHECK(q.resubscribe);
+    CHECK_EQ(q.qos, 0);
+    CHECK_EQ(dir.subscriptions().at(0).qos, 0);
+
+    CHECK_FALSE(dir.set_qos(9999, 1).found);
+    CHECK_EQ(dir.qos_of(9999), -1);
 }
 
 TEST(directory_handler_exception_is_isolated) {
     TopicDirectory dir;
     Sink           good;
-    int            dummy = 0;
+    Thrower        thrower;
 
-    dir.add("t", &dummy, throwing_fn, 1);
-    dir.add("t", &good, sink_fn, 1);
+    dir.add("t", throwing_handler(thrower), 1);
+    dir.add("t", sink_handler(good), 1);
 
     // 抛异常的 handler 不影响同批其它 handler，也不让异常逃出 dispatch
     CHECK_EQ(dir.dispatch("t", make_view("t", "x")), std::size_t{2});
@@ -195,7 +227,7 @@ TEST(directory_self_removal_inside_handler_does_not_deadlock) {
     SelfRemover    remover;
 
     remover.dir          = &dir;
-    const auto res       = dir.add("t", &remover, self_remove_fn, 1);
+    const auto res       = dir.add("t", self_handler(remover), 1);
     remover.slot         = res.slot;
 
     CHECK_EQ(dir.dispatch("t", make_view("t", "x")), std::size_t{1});
@@ -209,7 +241,6 @@ TEST(directory_self_removal_inside_handler_does_not_deadlock) {
 
 TEST(directory_remove_waits_for_inflight_dispatch) {
     TopicDirectory dir;
-    Sink           a;
 
     std::atomic<bool> in_handler{false};
     std::atomic<bool> release{false};
@@ -219,16 +250,15 @@ TEST(directory_remove_waits_for_inflight_dispatch) {
         std::atomic<bool>* in_handler;
         std::atomic<bool>* release;
         std::atomic<int>*  finished;
+
+        void on(const MessageView&) {
+            in_handler->store(true);
+            while (!release->load()) std::this_thread::yield();
+            finished->fetch_add(1);
+        }
     } slow{&in_handler, &release, &finished};
 
-    const auto slow_fn = [](void* obj, const MessageView&) {
-        auto* s = static_cast<Slow*>(obj);
-        s->in_handler->store(true);
-        while (!s->release->load()) std::this_thread::yield();
-        s->finished->fetch_add(1);
-    };
-
-    const auto slot = dir.add("t", &slow, +slow_fn, 1);
+    const auto slot = dir.add("t", Handler::callable([&slow](const MessageView& m) { slow.on(m); }), 1);
 
     std::thread dispatching([&] { dir.dispatch("t", make_view("t", "x")); });
     while (!in_handler.load()) std::this_thread::yield();
@@ -242,8 +272,6 @@ TEST(directory_remove_waits_for_inflight_dispatch) {
     remover.join();
     CHECK_EQ(finished.load(), 1);
     dispatching.join();
-
-    CHECK_EQ(a.count.load(), 0);  // 从未被调用
     CHECK(dir.empty());
 }
 
@@ -254,10 +282,10 @@ TEST(directory_routes_by_topic_filter) {
     Sink           hash;
     Sink           other;
 
-    dir.add("robot/1/cmd", &exact, sink_fn, 1);
-    dir.add("robot/+/cmd", &plus, sink_fn, 1);
-    dir.add("robot/#", &hash, sink_fn, 1);
-    dir.add("robot/2/cmd", &other, sink_fn, 1);
+    dir.add("robot/1/cmd", sink_handler(exact), 1);
+    dir.add("robot/+/cmd", sink_handler(plus), 1);
+    dir.add("robot/#", sink_handler(hash), 1);
+    dir.add("robot/2/cmd", sink_handler(other), 1);
 
     // 具体 topic 命中：精确 + 'robot/+/cmd' + 'robot/#'
     CHECK_EQ(dir.dispatch("robot/1/cmd", make_view("robot/1/cmd", "go")), std::size_t{3});
@@ -280,7 +308,7 @@ TEST(directory_routes_by_topic_filter) {
     CHECK_EQ(dir.dispatch("sensor/1", make_view("sensor/1", "x")), std::size_t{0});
 
     // 同一 filter 上的多播 + 摘除后不再命中
-    const auto extra = dir.add("robot/#", &hash, sink_fn, 1);
+    const auto extra = dir.add("robot/#", sink_handler(hash), 1);
     CHECK_EQ(dir.handler_count(), std::size_t{5});
     CHECK_EQ(dir.dispatch("robot/9/deep/cmd", make_view("robot/9/deep/cmd", "go")), std::size_t{2});
     CHECK_EQ(hash.count.load(), 5);
@@ -297,14 +325,11 @@ TEST(directory_remove_waits_for_async_view_copy) {
         std::atomic<bool> started{false};
     } async;
 
-    const auto post_to_pool = [](void* obj, const MessageView& m) {
-        auto* s = static_cast<AsyncSink*>(obj);
-        s->view = m;  // 按值捕获：凭据随副本一起存活
-        s->started.store(true, std::memory_order_release);
-    };
-
     TopicDirectory dir;
-    const auto     slot = dir.add("t/async", &async, +post_to_pool, 1);
+    const auto     slot = dir.add("t/async", Handler::callable([&async](const MessageView& m) {
+        async.view = m;  // 按值捕获：凭据随副本一起存活
+        async.started.store(true, std::memory_order_release);
+    }), 1);
 
     CHECK_EQ(dir.dispatch("t/async", make_view("t/async", "payload")), std::size_t{1});
     CHECK(async.started.load());
@@ -333,10 +358,10 @@ TEST(directory_async_view_keeps_message_data_alive) {
         MessageView view;
     } async;
 
-    const auto keep = [](void* obj, const MessageView& m) { static_cast<AsyncSink*>(obj)->view = m; };
-
     TopicDirectory dir;
-    const auto     slot = dir.add("t/keep", &async, +keep, 1);
+    const auto     slot = dir.add("t/keep", Handler::callable([&async](const MessageView& m) {
+        async.view = m;
+    }), 1);
 
     // 模拟 paho 消息：数据由共享对象持有，视图只是借用
     auto                   source = std::make_shared<const std::string>("binary-payload");
@@ -362,7 +387,7 @@ TEST(directory_concurrent_add_remove_dispatch) {
     Sink           resident;
     Sink           churn;
 
-    const auto keep = dir.add("t/a", &resident, sink_fn, 1);
+    const auto keep = dir.add("t/a", sink_handler(resident), 1);
     CHECK(keep.slot != 0);
 
     std::atomic<bool> stop{false};
@@ -376,7 +401,7 @@ TEST(directory_concurrent_add_remove_dispatch) {
 
     std::thread churner([&] {
         for (int i = 0; i < 300; ++i) {
-            const auto s = dir.add("t/a", &churn, sink_fn, 1);
+            const auto s = dir.add("t/a", sink_handler(churn), 1);
             std::this_thread::yield();
             dir.remove(s.slot);
         }

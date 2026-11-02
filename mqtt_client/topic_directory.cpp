@@ -55,14 +55,14 @@ struct TopicDirectory::Lease {
 // ---------------------------------------------------------------------------
 
 TopicDirectory::InstallResult
-TopicDirectory::add(std::string_view topic, void* obj, InvokeFn fn, int qos) {
+TopicDirectory::add(std::string_view topic, Handler handler, int qos) {
     if (topic.empty()) throw std::invalid_argument("mqttx::TopicDirectory: topic 不能为空");
-    if (fn == nullptr) throw std::invalid_argument("mqttx::TopicDirectory: handler 不能为空");
+    if (!handler.valid()) throw std::invalid_argument("mqttx::TopicDirectory: handler 不能为空");
 
-    auto slot    = std::make_shared<Slot>();
-    slot->slot   = next_slot_.fetch_add(1, std::memory_order_relaxed);
-    slot->obj.store(obj, std::memory_order_relaxed);
-    slot->fn = fn;
+    auto slot       = std::make_shared<Slot>();
+    slot->slot      = next_slot_.fetch_add(1, std::memory_order_relaxed);
+    slot->handler   = std::move(handler);
+    slot->qos       = qos;
 
     // 先取出 id：下面的 insert_or_assign 会移动 slot，不能依赖实参求值顺序
     const std::uint64_t id = slot->slot;
@@ -121,6 +121,16 @@ TopicDirectory::RemoveResult TopicDirectory::remove(std::uint64_t slot) {
                 res.unsubscribe = true;  // 该 topic 已无 handler：UNSUBSCRIBE
                 std::erase(wild_filters_, res.topic);
             }
+            else {
+                // 最大 QoS 可能随之下降：需要在 broker 侧按新 QoS 重新 SUBSCRIBE
+                int max_qos = 0;
+                for (const auto& h : handlers) max_qos = std::max(max_qos, h->qos);
+                res.qos = max_qos;
+                if (max_qos != it->second.qos) {
+                    it->second.qos  = max_qos;
+                    res.resubscribe = true;
+                }
+            }
         }
     }
 
@@ -140,20 +150,39 @@ TopicDirectory::RemoveResult TopicDirectory::remove(std::uint64_t slot) {
 }
 
 // ---------------------------------------------------------------------------
-// rebind
+// set_qos / qos_of
 // ---------------------------------------------------------------------------
 
-bool TopicDirectory::rebind(std::uint64_t slot, void* obj) noexcept {
-    try {
-        const std::shared_lock lk{mtx_};
-        auto                 it = by_slot_.find(slot);
-        if (it == by_slot_.end()) return false;
-        it->second.slot->obj.store(obj, std::memory_order_release);
-        return true;
+TopicDirectory::QosResult TopicDirectory::set_qos(std::uint64_t slot, int qos) {
+    QosResult res;
+
+    const std::unique_lock lk{mtx_};
+    auto                   rec = by_slot_.find(slot);
+    if (rec == by_slot_.end()) return res;
+
+    SlotPtr target = rec->second.slot;
+    target->qos    = qos;
+
+    res.found = true;
+    res.topic = rec->second.topic;
+
+    auto it = dir_.find(res.topic);
+    if (it == dir_.end()) return res;
+
+    int max_qos = 0;
+    for (const auto& h : it->second.handlers) max_qos = std::max(max_qos, h->qos);
+    res.qos = max_qos;
+    if (max_qos != it->second.qos) {
+        it->second.qos  = max_qos;
+        res.resubscribe = true;
     }
-    catch (...) {
-        return false;  // noexcept：理论上不会走到这里
-    }
+    return res;
+}
+
+int TopicDirectory::qos_of(std::uint64_t slot) const {
+    const std::shared_lock lk{mtx_};
+    auto                   it = by_slot_.find(slot);
+    return it == by_slot_.end() ? -1 : it->second.slot->qos;
 }
 
 // ---------------------------------------------------------------------------
@@ -225,9 +254,6 @@ std::size_t TopicDirectory::dispatch(std::string_view topic, const MessageView& 
 
         if (!h->alive.load(std::memory_order_acquire)) continue;  // 同批内已被摘除
 
-        void* obj = h->obj.load(std::memory_order_acquire);
-        if (obj == nullptr || h->fn == nullptr) continue;
-
         // 为本次调用准备带保活凭据的视图副本：
         //   - 同步 handler 用完即释放；
         //   - handler 若把副本投递到线程池，凭据会随副本存活，remove() 会一直等到
@@ -239,7 +265,7 @@ std::size_t TopicDirectory::dispatch(std::string_view topic, const MessageView& 
         t_active_slot = h.get();
         ++invoked;
         try {
-            h->fn(obj, call);  // 不持有目录锁执行用户代码
+            h->handler(call);  // 不持有目录锁执行用户代码
         }
         catch (const std::exception& e) {
             spdlog::error("[mqttx] topic={} 的 handler 抛出异常: {}", topic, e.what());

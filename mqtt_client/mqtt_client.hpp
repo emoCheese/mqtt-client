@@ -42,8 +42,6 @@ struct MqttConfig {
 ///   - 消费线程把消息按 topic 派发给全部 handler。
 class MqttClient : public IMqttClient {
 public:
-    using InvokeFn = TopicDirectory::InvokeFn;
-
     /// @throw std::invalid_argument broker_url 为空
     explicit MqttClient(MqttConfig cfg);
     ~MqttClient() override;
@@ -72,14 +70,18 @@ public:
     // ---- topic 目录（通常由 Topic<> 间接调用）-------------------------------
 
     /// 注册 handler 并（必要时）立即订阅；返回 slot。qos < 0 时使用 cfg.qos。
-    /// @throw std::invalid_argument topic 为空
-    std::uint64_t install(const std::string& topic, void* obj, InvokeFn fn, int qos = -1) override;
+    /// @throw std::invalid_argument topic 为空或 handler 无效
+    std::uint64_t install(const std::string& topic, Handler handler, int qos = -1) override;
 
     /// 摘除 slot：引用计数归零时退订。可能短暂阻塞到在飞回调结束。
     void uninstall(std::uint64_t slot) noexcept override;
 
-    /// Topic 对象 move 之后更新目录中的指针
-    void rebind(std::uint64_t slot, void* obj) noexcept override;
+    /// 目录级更新某 handler 的 QoS；slot 不变，必要时按新的最大 QoS 重订。
+    /// @return false 表示 slot 已失效
+    bool set_qos(std::uint64_t slot, int qos);
+
+    /// 某 handler 当前生效的 QoS；未知返回 -1。
+    [[nodiscard]] int effective_qos(std::uint64_t slot) const;
 
     /// 当前需要订阅的 (topic, qos) 快照
     [[nodiscard]] std::vector<TopicDirectory::Subscription> subscriptions() const;
