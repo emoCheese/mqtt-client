@@ -133,3 +133,95 @@ TEST(subscription_destructor_unsubscribes) {
     }
     CHECK_EQ(cli.topic_count(), std::size_t{0});
 }
+
+TEST(binding_factories_and_subscribe) {
+    MqttClient cli{test_config()};
+    Sink       a;
+    Sink       b;
+    Sink       c;
+
+    auto b1 = make_binding<&Sink::on>("f/member", a, 1);
+    CHECK_EQ(b1.filter(), std::string{"f/member"});
+    CHECK_EQ(b1.qos(), 1);
+
+    auto s1 = b1.open(cli);
+    auto s2 = subscribe(cli, "f/lambda", [&b](const MessageView& m) { b.on(m); }, 1);
+    auto s3 = subscribe(cli, "f/handler", on<&Sink::on>(c), 1);
+
+    CHECK(s1.active());
+    CHECK(s2.active());
+    CHECK(s3.active());
+    CHECK_EQ(cli.handler_count(), std::size_t{3});
+
+    CHECK_EQ(cli.dispatch("f/member", make_view("f/member", "1")), std::size_t{1});
+    CHECK_EQ(cli.dispatch("f/lambda", make_view("f/lambda", "2")), std::size_t{1});
+    CHECK_EQ(cli.dispatch("f/handler", make_view("f/handler", "3")), std::size_t{1});
+    CHECK_EQ(a.count, 1);
+    CHECK_EQ(b.count, 1);
+    CHECK_EQ(c.count, 1);
+
+    const auto callable = [](const MessageView&) {};
+    static_assert(MessageHandler<decltype(callable)>);
+}
+
+TEST(subscription_effective_qos_and_set_qos) {
+    MqttClient cli{test_config()};
+    Sink       a;
+    Sink       b;
+
+    auto sub = Binding{"q/a", sink_handler(a), -1}.open(cli);
+    CHECK_EQ(sub.qos(), -1);
+    CHECK_EQ(sub.effective_qos(), 1);  // cfg.qos
+
+    CHECK(sub.set_qos(2));
+    CHECK_EQ(sub.qos(), 2);
+    CHECK_EQ(sub.effective_qos(), 2);
+    CHECK_EQ(cli.subscriptions().at(0).qos, 2);
+    CHECK_EQ(cli.handler_count(), std::size_t{1});  // slot 未变
+
+    auto sub2 = Binding{"q/a", sink_handler(b), 0}.open(cli);
+    CHECK_EQ(cli.handler_count(), std::size_t{2});
+
+    CHECK(sub.set_qos(0));
+    CHECK_EQ(sub.effective_qos(), 0);
+    CHECK_EQ(cli.subscriptions().at(0).qos, 0);
+
+    sub.close();
+    CHECK_THROWS_AS(sub.set_qos(1), std::logic_error);
+    CHECK_EQ(sub2.effective_qos(), 0);
+}
+
+TEST(subscription_group_opens_and_closes_atomically) {
+    MqttClient cli{test_config()};
+    Sink       a;
+    Sink       b;
+
+    {
+        SubscriptionGroup group;
+        group.add(make_binding<&Sink::on>("g/a", a, 1));
+        group.add(make_binding<&Sink::on>("g/b", b, 0));
+        CHECK_EQ(group.size(), std::size_t{2});
+        CHECK_FALSE(group.opened());
+
+        group.open_all(cli);
+        CHECK(group.opened());
+        CHECK_EQ(cli.topic_count(), std::size_t{2});
+        CHECK_EQ(cli.dispatch("g/a", make_view("g/a", "1")), std::size_t{1});
+        CHECK_EQ(cli.dispatch("g/b", make_view("g/b", "2")), std::size_t{1});
+        CHECK_EQ(a.count, 1);
+        CHECK_EQ(b.count, 1);
+
+        CHECK_THROWS_AS(group.add(make_binding("g/c", Handler::callable([](const MessageView&) {}), 1)),
+                        std::logic_error);
+
+        group.close_all();
+        CHECK_FALSE(group.opened());
+        CHECK_EQ(cli.topic_count(), std::size_t{0});
+
+        group.open_all(cli);  // 可重新打开全部描述符
+        CHECK_EQ(cli.topic_count(), std::size_t{2});
+        group.open_all(cli);  // 幂等
+        CHECK_EQ(cli.topic_count(), std::size_t{2});
+    }
+    CHECK_EQ(cli.topic_count(), std::size_t{0});  // 析构关闭全部
+}

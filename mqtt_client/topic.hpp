@@ -94,27 +94,12 @@ public:
 
     [[nodiscard]] bool opened() const noexcept { return sub_ && sub_->active(); }
 
-    /// 修改 QoS：已激活时重新注册（触发重新 SUBSCRIBE）。
-    /// 失败时恢复到旧的 QoS 与激活状态。
+    /// 修改 QoS：已激活时走目录级更新（slot 不变），不产生退订/重订窗口。
     void set_qos(int qos) {
         if (binding_.qos() == qos) return;
-        const int  old_qos  = binding_.qos();
-        const bool was_open = opened();
-        if (was_open) close();
+        if (opened() && !sub_->set_qos(qos))
+            throw std::logic_error("mqttx::Topic: 注册已失效，无法修改 QoS");
         binding_.set_qos(qos);
-        if (was_open) {
-            try {
-                if (!open()) {
-                    binding_.set_qos(old_qos);
-                    (void)open();
-                }
-            }
-            catch (...) {
-                binding_.set_qos(old_qos);
-                (void)open();
-                throw;
-            }
-        }
     }
 
     // ---------- 业务接口 ----------
@@ -136,8 +121,11 @@ public:
     }
 
     [[nodiscard]] const std::string& name() const noexcept { return binding_.filter(); }
-    [[nodiscard]] int                qos() const noexcept { return binding_.qos(); }
-    [[nodiscard]] MqttClient&        client() const { return require_client(); }
+    /// 请求的 QoS（-1 表示客户端默认值）
+    [[nodiscard]] int qos() const noexcept { return binding_.qos(); }
+    /// 已激活时目录中实际生效的 QoS；未激活返回 -1
+    [[nodiscard]] int effective_qos() const { return sub_ ? sub_->effective_qos() : -1; }
+    [[nodiscard]] MqttClient& client() const { return require_client(); }
 
     /// 仅成员函数模式可用；可调用对象模式没有可返回的 Svc 对象。
     [[nodiscard]] Svc& service() requires (!std::is_null_pointer_v<decltype(M)>) {

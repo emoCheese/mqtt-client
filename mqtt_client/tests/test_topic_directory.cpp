@@ -167,6 +167,46 @@ TEST(directory_qos_is_max_of_handlers) {
     CHECK_EQ(subs.size(), std::size_t{1});
     CHECK_EQ(subs.at(0).topic, std::string{"t"});
     CHECK_EQ(subs.at(0).qos, 2);
+
+    // 摘除 QoS=2 的 handler：剩余最大 QoS 降为 1，需要按新 QoS 重订
+    const auto removed = dir.remove(hi.slot);
+    CHECK(removed.removed);
+    CHECK_FALSE(removed.unsubscribe);
+    CHECK(removed.resubscribe);
+    CHECK_EQ(removed.qos, 1);
+    CHECK_EQ(dir.subscriptions().at(0).qos, 1);
+}
+
+TEST(directory_set_qos_recomputes_max) {
+    TopicDirectory dir;
+    Sink           a;
+    Sink           b;
+
+    const auto sa = dir.add("t", sink_handler(a), 0);
+    const auto sb = dir.add("t", sink_handler(b), 2);
+
+    // 0 -> 2：最大值仍是 2，不需要重订
+    auto q = dir.set_qos(sa.slot, 2);
+    CHECK(q.found);
+    CHECK_FALSE(q.resubscribe);
+    CHECK_EQ(q.qos, 2);
+    CHECK_EQ(dir.qos_of(sa.slot), 2);
+
+    // 2 -> 0：另一个仍是 2，不需要重订
+    q = dir.set_qos(sb.slot, 0);
+    CHECK(q.found);
+    CHECK_FALSE(q.resubscribe);
+    CHECK_EQ(q.qos, 2);
+
+    // 最后一个 2 -> 0：最大值下降，需要重订
+    q = dir.set_qos(sa.slot, 0);
+    CHECK(q.found);
+    CHECK(q.resubscribe);
+    CHECK_EQ(q.qos, 0);
+    CHECK_EQ(dir.subscriptions().at(0).qos, 0);
+
+    CHECK_FALSE(dir.set_qos(9999, 1).found);
+    CHECK_EQ(dir.qos_of(9999), -1);
 }
 
 TEST(directory_handler_exception_is_isolated) {

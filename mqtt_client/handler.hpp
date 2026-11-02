@@ -19,6 +19,10 @@
 
 namespace mqttx {
 
+/// handler 的统一调用约束（成员绑定请用 on<&Svc::M>() 或 Handler::member）
+template <typename F>
+concept MessageHandler = std::is_invocable_v<F&, const MessageView&>;
+
 class Handler {
 public:
     Handler() noexcept = default;

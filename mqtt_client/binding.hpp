@@ -16,11 +16,14 @@
 #include "handler.hpp"
 #include "mqtt_client.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 namespace mqttx {
 
@@ -37,7 +40,7 @@ public:
     [[nodiscard]] const std::string& filter() const noexcept { return filter_; }
     [[nodiscard]] int                qos() const noexcept { return qos_; }
 
-    /// 只在未激活时修改；已激活请用 Subscription::set_qos（后续阶段提供）
+    /// 只在未激活时修改；已激活请用 Subscription::set_qos（目录级更新，不重订）
     void set_qos(int qos);
 
 private:
@@ -79,7 +82,24 @@ public:
 
     [[nodiscard]] bool active() const noexcept { return slot_ != 0; }
     [[nodiscard]] std::string_view filter() const noexcept { return filter_; }
+
+    /// 请求的 QoS（-1 表示使用客户端默认值）
     [[nodiscard]] int qos() const noexcept { return qos_; }
+
+    /// 目录中该 handler 实际生效的 QoS；未知/已关闭返回 -1。
+    [[nodiscard]] int effective_qos() const { return active() ? cli_->effective_qos(slot_) : -1; }
+
+    /// 目录级更新 QoS：slot 不变，仅按新的最大 QoS 重新 SUBSCRIBE。
+    /// @throw std::invalid_argument qos 越界；std::logic_error 未激活
+    /// @return false 表示 slot 已失效（并发 close）
+    bool set_qos(int qos) {
+        if (qos < -1 || qos > 2) throw std::invalid_argument("mqttx::Subscription: qos 必须在 [-1, 2]");
+        if (!active()) throw std::logic_error("mqttx::Subscription: 未激活");
+        if (qos == qos_) return true;
+        if (!cli_->set_qos(slot_, qos)) return false;
+        qos_ = qos;
+        return true;
+    }
 
 private:
     friend class Binding;
@@ -117,5 +137,92 @@ inline void Binding::set_qos(int qos) {
     if (qos < -1 || qos > 2) throw std::invalid_argument("mqttx::Binding: qos 必须在 [-1, 2]");
     qos_ = qos;
 }
+
+// ---------------------------------------------------------------------------
+// 工厂：统一成员函数 / 可调用对象 / 已擦除 Handler
+// ---------------------------------------------------------------------------
+
+template <auto M, typename Svc>
+    requires std::is_member_function_pointer_v<decltype(M)> &&
+             std::is_invocable_v<decltype(M), Svc*, const MessageView&>
+[[nodiscard]] Binding make_binding(std::string filter, Svc& svc, int qos = -1) {
+    return Binding{std::move(filter), Handler::member<Svc, M>(svc), qos};
+}
+
+template <typename F>
+    requires MessageHandler<F> && (!std::is_same_v<std::remove_cvref_t<F>, Handler>)
+[[nodiscard]] Binding make_binding(std::string filter, F&& fn, int qos = -1) {
+    return Binding{std::move(filter), Handler::callable(std::forward<F>(fn)), qos};
+}
+
+[[nodiscard]] inline Binding make_binding(std::string filter, Handler handler, int qos = -1) {
+    return Binding{std::move(filter), std::move(handler), qos};
+}
+
+template <auto M, typename Svc>
+    requires std::is_member_function_pointer_v<decltype(M)> &&
+             std::is_invocable_v<decltype(M), Svc*, const MessageView&>
+[[nodiscard]] Subscription subscribe(MqttClient& cli, std::string filter, Svc& svc, int qos = -1) {
+    return make_binding<M>(std::move(filter), svc, qos).open(cli);
+}
+
+template <typename F>
+    requires MessageHandler<F> && (!std::is_same_v<std::remove_cvref_t<F>, Handler>)
+[[nodiscard]] Subscription subscribe(MqttClient& cli, std::string filter, F&& fn, int qos = -1) {
+    return make_binding(std::move(filter), std::forward<F>(fn), qos).open(cli);
+}
+
+[[nodiscard]] inline Subscription
+subscribe(MqttClient& cli, std::string filter, Handler handler, int qos = -1) {
+    return Binding{std::move(filter), std::move(handler), qos}.open(cli);
+}
+
+// ---------------------------------------------------------------------------
+// SubscriptionGroup —— 批量/事务式订阅作用域
+// ---------------------------------------------------------------------------
+
+class SubscriptionGroup {
+public:
+    SubscriptionGroup() = default;
+    SubscriptionGroup(const SubscriptionGroup&)            = delete;
+    SubscriptionGroup& operator=(const SubscriptionGroup&) = delete;
+    SubscriptionGroup(SubscriptionGroup&&) noexcept        = default;
+    SubscriptionGroup& operator=(SubscriptionGroup&&) noexcept = default;
+
+    ~SubscriptionGroup() { close_all(); }
+
+    /// 只能在 open_all() 之前添加，避免“已打开但新绑定未生效”的歧义。
+    /// @throw std::logic_error 已经打开
+    void add(Binding binding) {
+        if (!active_.empty())
+            throw std::logic_error("mqttx::SubscriptionGroup: open_all 之后不能再 add");
+        bindings_.push_back(std::move(binding));
+    }
+
+    /// 打开全部绑定；任一失败则关闭已打开的部分（强保证）。
+    void open_all(MqttClient& cli) {
+        if (!active_.empty()) return;
+
+        std::vector<Subscription> opened;
+        opened.reserve(bindings_.size());
+        try {
+            for (const auto& binding : bindings_) opened.push_back(binding.open(cli));
+        }
+        catch (...) {
+            opened.clear();  // Subscription 析构即退订
+            throw;
+        }
+        active_ = std::move(opened);
+    }
+
+    void close_all() noexcept { active_.clear(); }
+
+    [[nodiscard]] bool        opened() const noexcept { return !active_.empty(); }
+    [[nodiscard]] std::size_t size() const noexcept { return bindings_.size(); }
+
+private:
+    std::vector<Binding>      bindings_;
+    std::vector<Subscription> active_;
+};
 
 }  // namespace mqttx

@@ -76,6 +76,13 @@ public:
     /// 摘除 slot：引用计数归零时退订。可能短暂阻塞到在飞回调结束。
     void uninstall(std::uint64_t slot) noexcept override;
 
+    /// 目录级更新某 handler 的 QoS；slot 不变，必要时按新的最大 QoS 重订。
+    /// @return false 表示 slot 已失效
+    bool set_qos(std::uint64_t slot, int qos);
+
+    /// 某 handler 当前生效的 QoS；未知返回 -1。
+    [[nodiscard]] int effective_qos(std::uint64_t slot) const;
+
     /// 当前需要订阅的 (topic, qos) 快照
     [[nodiscard]] std::vector<TopicDirectory::Subscription> subscriptions() const;
 

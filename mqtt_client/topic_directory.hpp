@@ -64,11 +64,21 @@ public:
         int           qos{0};        ///< 该 topic 当前生效的 QoS
     };
 
-    /// remove() 的结果：调用方可据此决定是否发送 UNSUBSCRIBE
+    /// remove() 的结果：调用方可据此决定是否发送 UNSUBSCRIBE / 重新 SUBSCRIBE
     struct RemoveResult {
         bool        removed{false};      ///< 是否真的摘除了一个登记项
         bool        unsubscribe{false};  ///< true = 该 topic 已无 handler，需 UNSUBSCRIBE
+        bool        resubscribe{false};  ///< true = 剩余 handler 的最大 QoS 变了，需重新 SUBSCRIBE
+        int         qos{0};              ///< 剩余 handler 的最大 QoS
         std::string topic;               ///< 被摘除登记项所属的 topic
+    };
+
+    /// set_qos() 的结果
+    struct QosResult {
+        bool        found{false};        ///< slot 是否存在
+        bool        resubscribe{false};  ///< true = 该 topic 的最大 QoS 变了
+        int         qos{0};              ///< 该 topic 当前生效的 QoS
+        std::string topic;
     };
 
     /// 供 subscribe_all() 使用的快照项
@@ -94,6 +104,13 @@ public:
     ///   2) handler 派生出去的异步任务不再持有保活凭据（MessageView::keep_alive）。
     /// @note 幂等：未知 slot 返回 removed=false。
     RemoveResult remove(std::uint64_t slot);
+
+    /// 更新某个 handler 的 QoS，并按剩余 handler 的最大值决定是否重新订阅。
+    /// @note 不改变 slot；未知 slot 返回 found=false。
+    QosResult set_qos(std::uint64_t slot, int qos);
+
+    /// 某个 slot 当前生效的 QoS；未知返回 -1。
+    [[nodiscard]] int qos_of(std::uint64_t slot) const;
 
     /// 把消息派发给所有匹配 topic 的 handler，返回实际调用的 handler 数。
     ///
@@ -121,6 +138,7 @@ private:
     struct Slot {
         std::uint64_t      slot{0};
         Handler            handler;        ///< 注册后不可变，无需 rebind
+        int                qos{0};         ///< 该 handler 请求的生效 QoS（由目录锁保护）
         std::atomic<bool>  alive{true};
         std::atomic<int>   inflight{0};    ///< 正在执行该 handler 调用的线程数
         std::atomic<int>   async_refs{0};  ///< 外部仍持有的保活凭据份数

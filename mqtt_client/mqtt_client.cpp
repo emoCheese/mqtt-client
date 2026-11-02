@@ -151,10 +151,10 @@ std::uint64_t MqttClient::install(const std::string& topic, Handler handler, int
 void MqttClient::uninstall(std::uint64_t slot) noexcept {
     try {
         const auto res = dir_.remove(slot);
-        if (!res.removed || res.topic.empty()) return;
+        if (!res.removed || res.topic.empty() || !is_running()) return;
 
-        if (res.unsubscribe && is_running()) {
-            const std::lock_guard lk{session_mtx_};
+        const std::lock_guard lk{session_mtx_};
+        if (res.unsubscribe) {
             session_subs_.erase(res.topic);
             try {
                 inner_->unsubscribe(res.topic);
@@ -164,11 +164,44 @@ void MqttClient::uninstall(std::uint64_t slot) noexcept {
                 spdlog::error("[mqttx] UNSUBSCRIBE {} 失败: {}", res.topic, e.what());
             }
         }
+        else if (res.resubscribe) {
+            try {
+                inner_->subscribe(res.topic, res.qos);
+                session_subs_.insert(res.topic);
+                spdlog::debug("[mqttx] RESUBSCRIBE {} (qos={})", res.topic, res.qos);
+            }
+            catch (const mqtt::exception& e) {
+                spdlog::error("[mqttx] RESUBSCRIBE {} 失败: {}", res.topic, e.what());
+            }
+        }
     }
     catch (...) {
         // noexcept：摘除失败也不能让析构路径抛异常
     }
 }
+
+bool MqttClient::set_qos(std::uint64_t slot, int qos) {
+    if (qos < -1 || qos > 2) throw std::invalid_argument("mqttx::MqttClient: qos 必须在 [-1, 2]");
+
+    const int      eff = (qos < 0) ? cfg_.qos : qos;
+    const auto     res = dir_.set_qos(slot, eff);
+    if (!res.found) return false;
+
+    if (res.resubscribe && is_running()) {
+        const std::lock_guard lk{session_mtx_};
+        try {
+            inner_->subscribe(res.topic, res.qos);
+            session_subs_.insert(res.topic);
+            spdlog::debug("[mqttx] RESUBSCRIBE {} (qos={})", res.topic, res.qos);
+        }
+        catch (const mqtt::exception& e) {
+            spdlog::error("[mqttx] RESUBSCRIBE {} 失败: {}", res.topic, e.what());
+        }
+    }
+    return true;
+}
+
+int MqttClient::effective_qos(std::uint64_t slot) const { return dir_.qos_of(slot); }
 
 std::vector<TopicDirectory::Subscription> MqttClient::subscriptions() const {
     return dir_.subscriptions();
