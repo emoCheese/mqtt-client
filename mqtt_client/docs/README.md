@@ -25,13 +25,13 @@
 | --- | --- |
 | **topic filter** | 订阅用的过滤器，可含 `+`（单级通配）与 `#`（多级通配），如 `robot/+/cmd` |
 | **topic** | 消息实际到达的具体主题，如 `robot/1/cmd`；一条消息会命中**所有**匹配的 filter |
-| **handler** | 一次注册对应的处理逻辑：`InvokeFn = void(*)(void*, const MessageView&)` |
-| **slot / 句柄** | `install()` 返回的 `uint64_t`，代表"一个 Topic 对象的一次注册" |
-| **登记项** | 目录内部的 `Slot` 结构，与 slot 一一对应（含目标指针、两个计数器） |
-| **thunk** | 编译期生成的静态跳板 `Topic<Svc, M>::invoke`，把类型擦除的 `void*` 还原成 `Topic<Svc, M>*` |
+| **Handler** | 类型擦除后的处理器：成员模式 `{Svc*, thunk}`（零分配）或可调用模式 `{State<F>*, thunk}` |
+| **slot / 句柄** | `install()` 返回的 `uint64_t`，代表"一次注册"；由 `Subscription` 独占 |
+| **登记项** | 目录内部的 `Slot` 结构，与 slot 一一对应（含不可变 `Handler`、生效 QoS、三个计数器） |
+| **thunk** | 编译期生成的静态跳板 `Handler::invoke_member/invoke_state`，把 `void*` 还原成 `Svc*` 或 `State<F>*` |
 | **借用视图** | `MessageView`：`topic`/`payload`/`props` 指向底层 paho 消息，不拥有数据 |
 | **保活凭据** | `KeepAlive`：引用计数句柄，同时持有底层消息与登记项，随 `MessageView` 副本流动 |
-| **在飞调用** | 正在执行 `h->fn(...)` 的调用帧，由 `Slot::inflight` 计数 |
+| **在飞调用** | 正在执行 `h->handler(...)` 的调用帧，由 `Slot::inflight` 计数 |
 | **异步副本** | handler 投递到线程池后仍存活的 `MessageView` 副本，由 `Slot::async_refs` 计数 |
 | **会话订阅集合** | `session_subs_`：本进程认为 broker 侧当前已存在的订阅，用于重连时只补差异 |
 
@@ -49,14 +49,17 @@
 
 ```
 mqtt_client/
-├── topic.hpp                  用户层：Topic<Svc, M> / TopicFn / make_topic
-├── imqtt_client.h             契约层：start/stop/install/uninstall/rebind
+├── handler.hpp                绑定单元：Handler（成员/可调用）+ on<M>
+├── binding.hpp                用户层：Binding / Subscription / SubscriptionGroup / 工厂
+├── publisher.hpp              发布层：Publisher（拒绝通配符 topic）
+├── topic.hpp                  兼容门面：Topic<Svc, M> / TopicFn / make_topic
+├── imqtt_client.h             契约层：start/stop/install/uninstall
 ├── mqtt_client.hpp/.cpp       传输层：连接、消费线程、订阅补齐、发布、本地注入
 ├── topic_directory.hpp/.cpp   路由层：filter→handler 目录 + 生命周期协议（本库核心）
 ├── topic_filter.hpp           规则层：MQTT filter 匹配（+ / # / $）
 ├── message.hpp                数据层：MessageView / KeepAlive / Owned
 ├── tests/                     单元测试（自带极简框架，无外部依赖）
 │   └── integration/           端到端测试 + 极简 MQTT v5 mock broker（Python）
-├── examples/topic_demo.cpp    用法示例（离线 / 在线 / 异步三种）
+├── examples/topic_demo.cpp    用法示例（离线 / 绑定 API / 在线 / 异步）
 └── docs/                      本文档目录
 ```

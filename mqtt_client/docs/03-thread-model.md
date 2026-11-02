@@ -20,20 +20,19 @@
 | --- | --- | --- | --- |
 | `MqttClient::start` | ✅ | ❌ 不要 | 见 3.7 重启注意 |
 | `MqttClient::stop` | ✅ | ⚠️ 允许但不 join 自己 | 不会自死锁，但不要随即析构 `MqttClient` |
-| `MqttClient::install/uninstall/rebind` | ✅ | ✅（`Topic::open/close`） | 这是"回调内再注册"设计支持的核心场景 |
+| `MqttClient::install/uninstall/set_qos` | ✅ | ✅（`Binding::open` / `Subscription::close/set_qos`） | 这是"回调内再注册"设计支持的核心场景 |
 | `TopicDirectory::dispatch` | ✅（离线注入） | ✅（正常路径） | 目录层支持并发 dispatch；`MqttClient` 不用 |
 | `publish` | ✅ | ✅ | paho 自身线程安全；未连接时抛 `mqtt::exception` |
-| `Topic::open/close/set_qos` | ✅ | ✅ | 幂等 |
-| `Topic` 析构 | ✅ | ⚠️ 只在自己是当前 handler 时安全（自等豁免） | 见 `05` 的边界说明 |
+| `Binding::open` / `Subscription::close/set_qos` | ✅ | ✅ | `open`/`close` 幂等；`set_qos` 目录级更新 |
+| `Subscription` / `Topic` 析构 | ✅ | ⚠️ 只在自己是当前 handler 时安全（自等豁免） | 见 `05` 的边界说明 |
 | `MqttClient` 析构 | ✅ | ❌ 会 join 当前线程 | 不要在 handler 里销毁客户端 |
 
 ## 3.3 同步原语清单
 
 | 原语 | 类型 | 保护/表达 | 使用处 |
 | --- | --- | --- | --- |
-| `mtx_` | `std::shared_mutex` | `dir_` / `wild_filters_` / `by_slot_` | `add` / `remove` / `rebind` / `dispatch` / 查询接口 |
+| `mtx_` | `std::shared_mutex` | `dir_` / `wild_filters_` / `by_slot_` | `add` / `remove` / `set_qos` / `dispatch` / 查询接口 |
 | `Slot::alive` | `atomic<bool>` | "本登记项是否已被摘除" | `remove` 写（release）、`dispatch` 读（acquire） |
-| `Slot::obj` | `atomic<void*>` | 目标对象指针（支持 move 后 rebind） | `rebind` 写（release）、`dispatch` 读（acquire） |
 | `Slot::inflight` | `atomic<int>` | **在飞调用帧**计数 | `dispatch` ±1（acq_rel）、`remove` 等待 |
 | `Slot::async_refs` | `atomic<int>` | **存活保活凭据**计数 | `Lease` 构造/析构 ±1、`remove` 等待 |
 | `session_mtx_` | `std::mutex` | `session_subs_` / `connected_once_` | `install` / `uninstall` / `on_connected` / `subscribe_all` |
@@ -51,7 +50,6 @@
 | 位置 | 序 | 理由 |
 | --- | --- | --- |
 | `alive.store(false)` / `alive.load()` | release / acquire | 保证"摘除标记"与"容器修改"对派发线程可见 |
-| `obj.store()` / `obj.load()` | release / acquire | 保证 `rebind` 写入的新指针与对象初始化对派发线程可见 |
 | `inflight` / `async_refs` 的 ±1 | acq_rel | 与 `wait/notify` 配对；release 保证计数归零前的写入对等待者可见 |
 | `running_` exchange | acq_rel | 一个线程的 start 与另一个线程的 stop 之间建立顺序 |
 | `next_slot_` fetch_add | relaxed | 只要求唯一，不承担同步职责 |
@@ -66,7 +64,7 @@ uninstall()  : dir_.remove() 返回（可能长时间阻塞）──► 取 sess
 on_connected(): { session_mtx_ 清空 } ──► subscribe_all(){ 取 session_mtx_ } ──► { 取 session_mtx_ 置位 }
 ```
 
-**R1 · 持锁不调用户代码**：`h->fn(...)` 只在 `mtx_` 之外调用。
+**R1 · 持锁不调用户代码**：`h->handler(...)` 只在 `mtx_` 之外调用。
 ⇒ handler 里 `open()`/`close()`（会取 `mtx_`）不会死锁。
 
 **R2 · 等待不持锁**：`remove` 的 `wait_until_zero(inflight)` / `wait_until_zero(async_refs)`
@@ -91,7 +89,7 @@ unlock
                                                 unlock
                                                 wait inflight == 0       ← ③ 等调用帧
 make_shared<Lease>  async_refs++ ← ④ 建凭据（此刻 inflight 仍 >0）
-h->fn(obj, call)                 ← 用户代码
+h->handler(call)                ← 用户代码
   └─ 若投递线程池：副本持有 Lease ⇒ async_refs 保持 >0
 inflight-- (notify)              ← ⑤ 调用帧结束
                                                 inflight==0 → 继续
@@ -148,7 +146,7 @@ running_.exchange(true)  ── 已 true ⇒ 直接返回   running_.exchange(fa
 
 | 你可以假设 | 你不可以假设 |
 | --- | --- |
-| 任意线程调用 `install/uninstall/rebind/publish/open/close` 都安全 | handler 会被多个线程并发调用（实际只有 T2 调用它） |
+| 任意线程调用 `install/uninstall/set_qos/publish` 与 `Binding::open` / `Subscription::close` 都安全 | handler 会被多个线程并发调用（实际只有 T2 调用它） |
 | handler 内可以安全地 `open/close` 其它（甚至自己）Topic | handler 内可以安全地析构 `MqttClient` |
 | `close()` 返回后，同步 handler 一定不再被调用 | `close()` 返回后，**你派生的异步任务**也一定结束了——只有按值捕获了消息副本（凭据）才会等待，见 `05` |
-| 同一个 `Topic` 对象不会被两个线程同时 move（它是普通对象，需自行保证） | `Topic::publish` 在 move 之后仍可用（会抛 `std::logic_error`） |
+| 同一个 `Subscription` / `Topic` 不会被两个线程同时 move/open/close（普通对象，需自行保证） | `Subscription::set_qos` / `Topic::publish` 在 move 之后仍可用（会抛 `std::logic_error`） |

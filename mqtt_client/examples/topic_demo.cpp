@@ -5,7 +5,9 @@
 //   ./mqttx_topic_demo tcp://127.0.0.1:1883   # 在线演示：真连 broker 收发
 // ---------------------------------------------------------------------------
 
+#include "binding.hpp"
 #include "mqtt_client.hpp"
+#include "publisher.hpp"
 #include "topic.hpp"
 
 #include <spdlog/spdlog.h>
@@ -112,6 +114,46 @@ void demo_offline() {
               << " alarm=" << session.alarms() << " topic数=" << cli.topic_count() << '\n';
 }
 
+/// 新 API 演示：Binding / Subscription / SubscriptionGroup / Publisher
+void demo_bindings() {
+    std::cout << "\n== Binding / Subscription / Publisher 演示 ==\n";
+
+    MqttConfig cfg;
+    cfg.broker_url = "tcp://127.0.0.1:1883";
+    cfg.client_id  = "mqttx-demo-bindings";
+    MqttClient cli{cfg};
+
+    RobotService svc;
+    int          lambda_hits = 0;
+    int          group_hits  = 0;
+
+    // 单条订阅：描述符 + RAII 凭据
+    auto member = mqttx::subscribe(cli, "bind/+/cmd",
+                                   mqttx::on<&RobotService::on_cmd>(svc), 1);
+    auto lambda = mqttx::subscribe(cli, "bind/lambda",
+                                   [&lambda_hits](const MessageView&) { ++lambda_hits; }, 1);
+
+    // 批量订阅：open_all 失败会回滚；析构关闭全部
+    mqttx::SubscriptionGroup group;
+    group.add(mqttx::make_binding("bind/g1", [&group_hits](const MessageView&) { ++group_hits; }, 0));
+    group.add(mqttx::make_binding("bind/g2", [&group_hits](const MessageView&) { ++group_hits; }, 1));
+    group.open_all(cli);
+
+    // 发布是独立的值对象；构造期即拒绝 +/#
+    mqttx::Publisher pub{cli, "bind/1/cmd", 1};
+    std::cout << "  Publisher topic=" << pub.topic() << " qos=" << pub.qos()
+              << "（离线模式不实际 publish）\n";
+
+    cli.dispatch("bind/1/cmd", msg("bind/1/cmd", R"({"v":1})", 1));
+    cli.dispatch("bind/lambda", msg("bind/lambda", "x", 1));
+    cli.dispatch("bind/g1", msg("bind/g1", "x", 0));
+    cli.dispatch("bind/g2", msg("bind/g2", "x", 1));
+
+    std::cout << "  member.cmds=" << svc.cmds() << " lambda=" << lambda_hits
+              << " group=" << group_hits
+              << " effective_qos=" << member.effective_qos() << '\n';
+}
+
 /// 在线演示：连接 broker，订阅后再发布，最后优雅退出
 void demo_online(const std::string& broker_url) {
     std::cout << "\n== 在线演示（broker=" << broker_url << "）==\n";
@@ -195,6 +237,7 @@ int main(int argc, char** argv) {
     spdlog::set_level(spdlog::level::info);
 
     demo_offline();
+    demo_bindings();
     demo_async();
 
     if (argc > 1) demo_online(argv[1]);

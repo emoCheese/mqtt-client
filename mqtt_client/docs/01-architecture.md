@@ -7,7 +7,7 @@
 | 目标 | 具体含义 | 对架构的硬性影响 |
 | --- | --- | --- |
 | **以 topic 为核心** | 应用的唯一描述方式是"哪个 filter 交给谁处理"；连接、订阅、重连、退订都不出现在业务代码里 | 必须有独立的**路由层**（目录），且它同时是订阅状态的唯一真相源 |
-| **通用** | 支持任意 `Svc` 的成员函数（含 const）与任意可调用对象 | 目录层必须**类型擦除**：只认 `void* + 函数指针 thunk` |
+| **通用** | 支持任意 `Svc` 的成员函数（含 const）与任意可调用对象 | 目录层必须**类型擦除**：统一为 `Handler`（成员模式零分配，可调用模式一次分配） |
 | **零拷贝** | 高频消息不复制 payload | `MessageView` 必须是借用视图 → 引出生命周期管理（见 `05`） |
 | **允许异步** | handler 可把消息投递到线程池 | 调用帧 ≠ 工作结束 → 必须引入可传递的保活凭据（见 `05`） |
 | **允许回调内再注册** | handler 里 `open()`/`close()` 别的 Topic 不得死锁 | 派发期间**不得持有目录锁**执行用户代码 |
@@ -18,16 +18,19 @@
 
 ```
 ┌─ 用户层 ────────────────────────────────────────────────────────────────┐
-│  topic.hpp                                                              │
-│    Topic<Svc, M>     cli, filter, svc, qos（M = &Svc::method）           │
-│    TopicFn           = Topic<std::function<void(const MessageView&)>>    │
-│    make_topic(...)   成员函数 / lambda 便捷工厂                          │
-│  职责：把"一个 filter 绑定到一个处理器"表达出来；open/close 幂等；move 自动 rebind │
+│  handler.hpp / binding.hpp / publisher.hpp / topic.hpp                  │
+│    Handler      {Svc*+thunk | shared_ptr<State<F>>+thunk}               │
+│    Binding      {filter, Handler, qos}：纯描述符，构造期校验             │
+│    Subscription {cli, slot}：移动-only RAII 凭据，析构退订              │
+│    SubscriptionGroup：批量 open/close，open_all 失败回滚               │
+│    Publisher    {cli, topic, qos, retain}：发布与订阅解耦                │
+│    Topic<Svc,M> = Binding + optional<Subscription>（兼容门面）          │
+│  职责：表达绑定；激活/退订走 RAII；move 只搬 slot，不存在 rebind          │
 └──────────────────────────────┬──────────────────────────────────────────┘
-                               │ install / uninstall / rebind / publish
+                               │ install / uninstall / set_qos / publish
 ┌─ 契约层 ─────────────────────┴──────────────────────────────────────────┐
 │  imqtt_client.h                                                         │
-│    IMqttClient  { start, stop, is_running, install, uninstall, rebind }  │
+│    IMqttClient  { start, stop, is_running, install, uninstall }         │
 │  职责：订阅侧最小契约；不泄漏 paho 细节，便于替换/测试替身                  │
 └──────────────────────────────┬──────────────────────────────────────────┘
                                │ 继承实现
@@ -40,13 +43,14 @@
 │      · 本地注入 dispatch()（离线测试、手工喂消息）                          │
 │  职责：所有"与 broker 打交道"的事；不认识任何业务类型                       │
 └──────────────────────────────┬──────────────────────────────────────────┘
-                               │ dir_.add / remove / rebind / dispatch
+                               │ dir_.add / remove / set_qos / dispatch
 ┌─ 路由层 ─────────────────────┴──────────────────────────────────────────┐
 │  topic_directory.hpp / topic_directory.cpp   ← 本库的核心与复杂度集中地    │
 │    TopicDirectory                                                       │
 │      · filter → 多播 handler 列表（dir_）                                 │
 │      · slot → filter 反查（by_slot_）                                     │
 │      · 通配 filter 索引（wild_filters_）                                  │
+│      · Slot 持有不可变 Handler + 生效 QoS                                 │
 │      · 生命周期协议：alive / inflight / async_refs + Lease                │
 │  职责：路由 + 引用计数 + 派发期与摘除期的生命周期安全                        │
 └───────────────┬─────────────────────────────────┬───────────────────────┘
@@ -62,28 +66,28 @@
 ## 1.3 依赖关系
 
 ```
-topic.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► topic_filter.hpp
-     │                │                   │
-     │                │                   └────────────► message.hpp ──► <mqtt/properties.h>
-     │                └────────────► <mqtt/async_client.h>
-     └────────────► imqtt_client.h ──► message.hpp
+topic.hpp ──► binding.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► handler.hpp
+publisher.hpp ──────────────┘           │                   │                  │
+     │                                  │                   └────────────► message.hpp
+     │                                  └────────────► <mqtt/async_client.h>
+     └────────────► topic_filter.hpp    imqtt_client.h ──► handler.hpp
 ```
 
 - 公开头文件直接暴露 paho 类型（`mqtt::async_client`、`mqtt::delivery_token_ptr`、
   `mqtt::properties`），因此 CMake 中 paho 必须是 **PUBLIC** 依赖；
   这是刻意的取舍：避免 pimpl 带来的间接层与分配。
 - `message.hpp` 只依赖 `<mqtt/properties.h>`，不依赖 async_client——数据契约保持轻量。
-- `TopicDirectory` 认识 `MessageView` 与 `InvokeFn`，但**不认识 paho**：
+- `TopicDirectory` 认识 `MessageView` 与 `Handler`，但**不认识 paho**：
   消息的具体类型（`mqtt::const_message_ptr`）由传输层塞进 `KeepAlive`（类型擦除）。
 
 ## 1.4 端到端数据流
 
 ```
         ┌────────────── 用户线程 ──────────────┐
-        │ Topic<Svc, M> t{cli,"robot/+/cmd",...} │
-        │ t.open()  ──► install()              │
+        │ Binding b{"robot/+/cmd", handler, qos} │
+        │ Subscription s = b.open(cli)          │
         └───────────────┬──────────────────────┘
-                        │ ① 注册（filter, thunk, void*）
+                        │ ① 注册（filter, Handler, qos）
                         ▼
                ┌──────────────────┐   ② 首次注册该 filter
                │  TopicDirectory  │ ─────────────► SUBSCRIBE(filter, max_qos)
@@ -98,7 +102,7 @@ topic.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► topi
                                                       │ ⑤ 精确 + 通配匹配，收集 Snapshot
                                                       │ ⑥ 每个 handler：Lease（async_refs+1）
                                                       ▼
-                                             Topic<Svc, M>::invoke ──► svc.on_x(view)
+                                             Handler::operator() ──► svc.on_x(view)
                                                       │
                      ⑦ 同步返回 → inflight-1          │  ⑦' 异步：pool.post([copy=view])
                      ⑧ 摘除：等 inflight → 等 async_refs │      → 任务结束才释放凭据
@@ -109,7 +113,7 @@ topic.hpp ──► mqtt_client.hpp ──► topic_directory.hpp ──► topi
 | 目标 | 类型 | 说明 |
 | --- | --- | --- |
 | `mqtt_client` / `mqttx::mqtt_client` | STATIC 库 | 库本体（源文件：`mqtt_client.cpp`、`topic_directory.cpp`） |
-| `mqttx_tests` | 可执行 | 单元测试：filter 规则、目录、Topic、生命周期、并发（不需要 broker） |
+| `mqttx_tests` | 可执行 | 单元测试：filter 规则、目录、Binding/Subscription、Publisher、Group、生命周期、并发（不需要 broker） |
 | `mqttx_online_test` | 可执行 | 端到端测试客户端（需要 broker，由 python 驱动脚本拉起 mock broker） |
 | `mqttx_topic_demo` | 可执行 | 示例：离线派发 / 异步 handler / 在线收发 |
 

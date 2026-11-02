@@ -225,3 +225,25 @@ TEST(subscription_group_opens_and_closes_atomically) {
     }
     CHECK_EQ(cli.topic_count(), std::size_t{0});  // 析构关闭全部
 }
+
+TEST(subscription_group_move_transfers_ownership) {
+    MqttClient cli{test_config()};
+    Sink       a;
+
+    SubscriptionGroup group;
+    group.add(make_binding<&Sink::on>("gm/a", a, 1));
+    group.open_all(cli);
+
+    SubscriptionGroup moved{std::move(group)};
+    CHECK(moved.opened());
+    CHECK_FALSE(group.opened());
+    CHECK_EQ(cli.topic_count(), std::size_t{1});
+
+    group = std::move(moved);
+    CHECK(group.opened());
+    CHECK_FALSE(moved.opened());
+    CHECK_EQ(cli.topic_count(), std::size_t{1});
+
+    group.close_all();
+    CHECK_EQ(cli.topic_count(), std::size_t{0});
+}

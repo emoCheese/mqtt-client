@@ -186,8 +186,21 @@ public:
     SubscriptionGroup() = default;
     SubscriptionGroup(const SubscriptionGroup&)            = delete;
     SubscriptionGroup& operator=(const SubscriptionGroup&) = delete;
-    SubscriptionGroup(SubscriptionGroup&&) noexcept        = default;
-    SubscriptionGroup& operator=(SubscriptionGroup&&) noexcept = default;
+
+    SubscriptionGroup(SubscriptionGroup&& o) noexcept
+        : bindings_{std::move(o.bindings_)}, active_{std::move(o.active_)} {
+        o.close_all();
+    }
+
+    SubscriptionGroup& operator=(SubscriptionGroup&& o) noexcept {
+        if (this != &o) {
+            close_all();
+            bindings_ = std::move(o.bindings_);
+            active_   = std::move(o.active_);
+            o.close_all();
+        }
+        return *this;
+    }
 
     ~SubscriptionGroup() { close_all(); }
 

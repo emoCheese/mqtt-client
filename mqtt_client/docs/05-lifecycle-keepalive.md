@@ -9,18 +9,18 @@
 | 对象 | 谁拥有 | 何时死亡 | 库能否观测 |
 | --- | --- | --- | --- |
 | `mqtt::message`（payload/topic/props 的真实载体） | paho + 消费循环里的 `const_message_ptr` | 本轮消费循环迭代结束 | ✅ |
-| handler **调用帧** | 消费线程栈 | `h->fn(...)` 返回 | ✅（`inflight`） |
+| handler **调用帧** | 消费线程栈 | `h->handler(...)` 返回 | ✅（`inflight`） |
 | handler **派生出的异步任务** | 用户线程池 | 未知 | ❌（只能靠用户传递的凭据） |
-| `Topic` / 业务 service | 应用 | 应用决定 | ❌（库只持有裸 `void*`） |
+| `Subscription` / 业务 service | 应用 | 应用决定 | ❌（库只持有裸 `Svc*`，由用户保证寿命） |
 
-`MessageView` 的三个视图字段是**借用**的（零拷贝的代价），目录里的 `obj` 是**裸指针**
+`MessageView` 的三个视图字段是**借用**的（零拷贝的代价），`Handler` 的成员模式保存一个**裸 `Svc*`**
 （类型擦除与零开销多态的代价）。两者叠加"未知时刻"的异步任务，就必须有一个
 **跨线程、可传递、库可观测**的信号来界定"什么时候才算真的没人用了"。
 
 ## 5.2 为什么 `inflight` 一个计数器不够
 
 ```
-[消费线程]  h->fn(obj, msg) ──► pool.post(...) ──► return
+[消费线程]  h->handler(msg) ──► pool.post(...) ──► return
                   │                                    │
             inflight = 1                          inflight = 0   ← 调用帧结束
                                                        │
@@ -185,7 +185,7 @@ C++ 的析构顺序与声明顺序相反：`~Session` 先析构 `cmd_/st_`（`re
 | 自等豁免（R3） | `directory_self_removal_inside_handler_does_not_deadlock` | 无豁免会挂死，由 ctest 超时兜底 |
 | 异常隔离 | `directory_handler_exception_is_isolated` | 抛异常的 handler 不影响同批 |
 | 并发 add/remove/dispatch | `directory_concurrent_add_remove_dispatch` | ASan / TSan 下运行 |
-| move 后 rebind（I15） | `topic_move_ctor_preserves_registration`、`topic_move_assignment_preserves_registration`、`topic_moved_from_object_is_inert` | |
+| move 保留注册、无 rebind（I15/I16） | `topic_move_ctor_preserves_registration`、`topic_move_assignment_preserves_registration`、`topic_moved_from_object_is_inert`、`subscription_move_preserves_registration` | |
 | 重连只补差异订阅（I12） | 端到端测试的 `SUBSCRIBE` 次数断言（`mock_broker.py` 日志） | 首次连接全量、连接事件不重复订阅 |
 | 端到端（真实 socket + 消费线程） | `mqttx_online`（[`../tests/integration/test_online.cpp`](../tests/integration/test_online.cpp)） | 含异步 handler 读回载荷 |
 

@@ -5,11 +5,12 @@
 生命周期）全部由库负责。
 
 ```
-     Topic<Svc, M> / TopicFn         TopicDirectory                paho.mqtt.cpp
-   ┌────────────────────┐        ┌──────────────────────┐       ┌───────────────┐
-   │ robot/+/cmd → svc  │ open() │ robot/+/cmd → [h1,h2]│ SUB→  │ async_client  │
-   │ robot/#     → λ    │ ─────► │ robot/#     → [h3]   │ ◄─MSG │ consumer queue│
-   └────────────────────┘ close()└──────────────────────┘       └───────────────┘
+  Binding / Subscription / Publisher      TopicDirectory              paho.mqtt.cpp
+   ┌──────────────────────────┐        ┌──────────────────────┐     ┌───────────────┐
+   │ robot/+/cmd → Handler    │ open() │ robot/+/cmd → [h1,h2]│ SUB→ │ async_client  │
+   │ robot/#     → λ          │ ─────► │ robot/#     → [h3]   │ ◄─MSG│ consumer queue│
+   └──────────────────────────┘ close()└──────────────────────┘     └───────────────┘
+        Publisher ── publish ─────────────► MqttClient ──► paho
                                         │ dispatch(topic, msg)
                                         ▼
                               按 MQTT filter 规则匹配后多播给 handler
@@ -19,8 +20,11 @@
 
 | 文件 | 作用 |
 | --- | --- |
-| `topic.hpp` | `Topic<Svc, M>` / `TopicFn`：把一个 topic filter 绑定到成员函数或可调用对象 |
-| `mqtt_client.hpp/.cpp` | `MqttClient`：连接、消费线程、订阅补齐、发布 |
+| `handler.hpp` | `Handler`：类型擦除后的处理器；成员函数零分配，可调用对象一次分配 |
+| `binding.hpp` | `Binding`（纯描述符）、`Subscription`（RAII 激活凭据）、`SubscriptionGroup`、`make_binding` / `subscribe` |
+| `publisher.hpp` | `Publisher`：发布侧值对象，构造期拒绝通配符 topic |
+| `topic.hpp` | `Topic<Svc, M>` / `TopicFn` / `make_topic`：兼容门面，内部是 `Binding + Subscription` |
+| `mqtt_client.hpp/.cpp` | `MqttClient`：连接、消费线程、订阅补齐、发布、目录级 QoS 更新 |
 | `topic_directory.hpp/.cpp` | `TopicDirectory`：topic filter → handler 的目录（多播、引用计数、生命周期安全） |
 | `topic_filter.hpp` | MQTT topic filter 匹配规则（`+` / `#` / `$` 规则） |
 | `message.hpp` | `MessageView`：消息的借用视图与 `deep_copy()` |
@@ -47,8 +51,8 @@
 ## 快速上手
 
 ```cpp
-#include "mqtt_client.hpp"
-#include "topic.hpp"
+#include "binding.hpp"
+#include "publisher.hpp"
 
 struct Robot {
     void on_cmd(const mqttx::MessageView& m)            { /* ... */ }
@@ -60,24 +64,35 @@ cfg.broker_url = "tcp://127.0.0.1:1883";
 mqttx::MqttClient cli{cfg};
 
 Robot robot;
-mqttx::Topic<Robot, &Robot::on_cmd>    cmd{cli, "robot/+/cmd", robot, /*qos=*/1};
-mqttx::Topic<Robot, &Robot::on_status> status{cli, "robot/+/status", robot, 0};
-auto alarm = mqttx::make_topic(cli, "robot/alarm", [](const mqttx::MessageView& m) {
-    // lambda 形式
-});
 
-cmd.open();      // 显式注册；析构自动 close()
-status.open();
-alarm.open();
+// 推荐：描述符 + RAII 凭据；析构 Subscription 即退订
+auto cmd = mqttx::subscribe(cli, "robot/+/cmd",
+                            mqttx::on<&Robot::on_cmd>(robot), 1);
+auto status = mqttx::subscribe(cli, "robot/+/status",
+                               mqttx::on<&Robot::on_status>(robot), 0);
+auto alarm = mqttx::subscribe(cli, "robot/alarm",
+                              [](const mqttx::MessageView& m) { /* lambda */ }, 2);
+
+// 发布是独立的值对象；构造期拒绝含 +/# 的 topic
+mqttx::Publisher pub{cli, "robot/1/cmd", 1};
 
 cli.start();                      // 连接 + 启动消费线程（失败抛异常）
-cli.publish("robot/1/cmd", R"({"v":1})");
+pub.publish(R"({"v":1})");
 cli.stop();                       // 幂等；析构也会调用
 ```
 
-> **为什么要显式 `open()`？**
-> `Topic` 构造期间不把 `this` 交给别的线程，必须等对象完全构造后再注册。
-> 典型写法是在 Session 构造体末尾统一 `open()`（见 `examples/topic_demo.cpp`）。
+需要在 Session 构造期延迟注册时，用两步式（推荐给成员变量）：
+
+```cpp
+auto binding = mqttx::make_binding("robot/+/cmd", mqttx::on<&Robot::on_cmd>(robot), 1);
+// ... 对象完全构造后
+auto subscription = binding.open(cli);
+```
+
+> **为什么要显式 `open()` / `subscribe` 二选一？**
+> `Binding` 构造不把 `this` 交给别的线程；必须等对象完全构造后再激活。
+> `subscribe(...)` 等价于 `make_binding(...).open(cli)`，适合已完全构造的场景。
+> 旧的 `Topic<Svc, M>` 仍可用，内部就是 `Binding + Subscription`。
 
 ## 核心语义
 
@@ -100,6 +115,7 @@ cli.stop();                       // 幂等；析构也会调用
 | 首次注册某 filter | `subscribe = true` | `SUBSCRIBE` |
 | 再次注册同一 filter | 只增加 handler | 不重复订阅 |
 | 某 handler 的 QoS 提升 | `subscribe = true` | 按更高 QoS 重新 `SUBSCRIBE` |
+| 某 handler 的 QoS 下降 | 重算最大 QoS，必要时 `resubscribe = true` | 按新的最大 QoS 重新 `SUBSCRIBE` |
 | 摘除最后一个 handler | `unsubscribe = true` | `UNSUBSCRIBE` |
 
 ### 3. 连接与重连
@@ -114,11 +130,13 @@ cli.stop();                       // 幂等；析构也会调用
 ### 4. 生命周期与线程安全
 
 - **派发线程只有一个**（消费线程），`dispatch()` 不持有目录锁调用用户代码，
-  因此在 handler 里 `open()` / `close()` 别的 Topic（甚至自己）都不会死锁；
-- 同一个 `Topic<Svc, M>` 被 move 之后会自动 `rebind`，目录里的指针始终指向存活对象；
-- `close()` / 析构会等待该 handler 的**在飞调用返回**，并且继续等待 handler
-  派生出去的**异步任务释放消息副本**（见下一节），之后目标对象才会被回收；
-- `Topic::publish()` / `client()` 在被 move 走的对象上调用会抛 `std::logic_error`；
+  因此在 handler 里调用 `Binding::open()` / `Subscription::close()`（甚至关闭自己）都不会死锁；
+- 目录的 `Slot` 直接持有 `Handler`，`Subscription` / `Topic` move 只搬运 slot，
+  **不存在 rebind**；moved-from 的 `Topic` 是惰性的；
+- `Subscription::close()` / 析构会等待该 handler 的**在飞调用返回**，并且继续等待 handler
+  派生出去的**异步任务释放消息副本**（见下一节），之后 handler 状态才会被回收；
+- `Topic::publish()` / `client()` / `service()` 在被 move 走的对象上调用会抛 `std::logic_error`；
+- 需要在 handler 内一次性关闭一组订阅时用 `SubscriptionGroup`；其析构按 RAII 关闭全部；
 - 不要在 handler 里析构 `MqttClient` 本身（那会 join 当前线程）。
 
 ### 5. 异步 handler（线程池）
@@ -127,7 +145,7 @@ cli.stop();                       // 幂等；析构也会调用
 派发帧返回后消息随时可能被释放，因此**异步使用时必须把视图一起带走**：
 
 ```cpp
-auto topic = mqttx::make_topic(cli, "robot/+/telemetry", [&pool](const mqttx::MessageView& m) {
+auto sub = mqttx::subscribe(cli, "robot/+/telemetry", [&pool](const mqttx::MessageView& m) {
     pool.post([copy = m] {                 // 按值捕获整个 MessageView
         use(copy.topic, copy.payload);     // 任务执行期间数据一直有效
     });
@@ -143,11 +161,11 @@ auto topic = mqttx::make_topic(cli, "robot/+/telemetry", [&pool](const mqttx::Me
 | 异步任务按值捕获了视图 | 任务存活期间消息数据有效；`close()` / 析构会**等到任务释放副本**才回收目标对象 |
 | 先 `deep_copy()` 再投递 | `Owned` 自带字符串副本，同时保留凭据，同样安全 |
 
-所以不会再出现“`h->fn(obj, msg)` 早已返回、guard 也析构了，而 handler 还在飞”的悬垂：
+所以不会再出现“`h->handler(msg)` 早已返回、guard 也析构了，而 handler 还在飞”的悬垂：
 
 ```cpp
 cli.dispatch("robot/3/telemetry", view);  // 派发帧立刻返回
-topic.close();                            // 阻塞到 worker 释放副本（示例中约 150ms）
+sub.close();                              // 阻塞到 worker 释放副本（示例中约 150ms）
 ```
 
 两条使用约束：
@@ -161,8 +179,8 @@ topic.close();                            // 阻塞到 worker 释放副本（示
    ```
 
 2. 异步任务若要访问业务对象（Session 里的 service），请保证**成员声明顺序是
-   「service 在前、Topic 在后」**，这样 `~Session` 会先析构 Topic（等待异步任务），
-   再析构 service。示例见 `examples/topic_demo.cpp` 的 `demo_async()`。
+   「client → service → Subscription/Binding」**，这样 `~Session` 会先析构订阅
+   （等待异步任务），再析构 service。示例见 `examples/topic_demo.cpp` 的 `demo_async()`。
 
 代价：每次 handler 调用会有一次小的凭据分配（百纳秒量级），同步路径用完即释放，
 不产生额外等待。
@@ -181,7 +199,7 @@ ctest --test-dir build --output-on-failure
 
 | 测试 | 内容 |
 | --- | --- |
-| `mqttx_tests` | 单元测试：filter 匹配规则、多播、引用计数、QoS、move/rebind、回调内自析构、异常隔离、并发竞争、**异步 handler 保活/等待语义** |
+| `mqttx_tests` | 单元测试：filter 匹配规则、多播、引用计数、QoS 升降级、`Binding`/`Subscription` move 与 RAII、`SubscriptionGroup`、`Publisher`、回调内自析构、异常隔离、并发竞争、**异步 handler 保活/等待语义** |
 | `mqttx_online` | 端到端测试：由 `tests/integration/mock_broker.py`（纯标准库实现的极简 MQTT v5 broker）驱动，验证 连接 → 订阅 → 发布 → 回环 → 按 filter 派发 → 异步任务读取 → 退订 的完整链路 |
 
 也可以手工跑端到端测试：
@@ -206,8 +224,13 @@ ctest --test-dir build-asan --output-on-failure
 
 # TSan 在新内核上若报 "unexpected memory mapping"，需关闭 ASLR：
 cmake -S . -B build-tsan -DMQTTX_SANITIZERS=thread && cmake --build build-tsan
-setarch $(uname -m) -R env TSAN_OPTIONS=halt_on_error=0 ctest --test-dir build-tsan --output-on-failure
+setarch $(uname -m) -R env TSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-tsan --output-on-failure
 ```
+
+> TSan 构建只注册 `mqttx_tests`：paho 的 `token::on_success5` 在
+> `MqttClient::start()` 的 `wait_for` 路径上会触发 TSan 的
+> "double lock of a mutex"，属于第三方库内部锁，与本库代码无关。
+> ASan/UBSan 构建仍会跑完整的 `mqttx_tests + mqttx_online`。
 
 ## 与 `mqtt_client0` 的关系
 
