@@ -20,6 +20,7 @@
 #include "binding.hpp"
 #include "handler.hpp"
 #include "message.hpp"
+#include "topic_filter.hpp"
 #include "mqtt_client.hpp"
 
 #include <cstddef>
@@ -119,15 +120,18 @@ public:
     // ---------- 业务接口 ----------
 
     /// 向本 topic 发布（qos < 0 使用客户端默认 QoS）
+    /// @throw std::invalid_argument 当前绑定是含 '+' / '#' 的 filter
     /// @throw std::logic_error Topic 已被 move 走
     mqtt::delivery_token_ptr
     publish(std::string payload, int qos = -1, bool retain = false) {
+        require_publishable_topic();
         return require_client().publish(binding_.filter(), std::move(payload), qos, retain);
     }
 
     /// 二进制载荷
     mqtt::delivery_token_ptr
     publish_binary(const void* data, std::size_t len, int qos = -1, bool retain = false) {
+        require_publishable_topic();
         return require_client().publish_binary(binding_.filter(), data, len, qos, retain);
     }
 
@@ -152,6 +156,11 @@ private:
     [[nodiscard]] Svc* require_service() const {
         if (svc_ == nullptr) throw std::logic_error("mqttx::Topic: 未绑定服务对象（对象已被移动）");
         return svc_;
+    }
+
+    void require_publishable_topic() const {
+        if (is_wildcard_filter(binding_.filter()))
+            throw std::invalid_argument("mqttx::Topic: 不能向含通配符的 filter 发布");
     }
 
     MqttClient*               cli_{nullptr};
