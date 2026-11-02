@@ -6,8 +6,8 @@
 
 | # | 线程 | 谁创建 | 运行什么 | 数量 |
 | --- | --- | --- | --- | --- |
-| T1 | **应用线程**（任意个） | 应用 | `Topic::open/close/set_qos/publish`、`MqttClient::start/stop/publish/install/uninstall`、`deep_copy` 等 | 0..N |
-| T2 | **消费线程** | `MqttClient::start()` 里的 `std::jthread` | `consume_loop` → `dispatch` → `Topic::invoke` → 用户 handler | **恰好 1** |
+| T1 | **应用线程**（任意个） | 应用 | `Binding::open` / `Subscription::close/set_qos`、`Publisher::publish`、`MqttClient::start/stop/publish/install/uninstall`、`deep_copy` 等 | 0..N |
+| T2 | **消费线程** | `MqttClient::start()` 里的 `std::jthread` | `consume_loop` → `dispatch` → `Handler::operator()` → 用户 handler | **恰好 1** |
 | T3 | **paho 网络线程** | paho.mqtt.c | socket 收发、协议状态机、把消息/事件压入 consumer queue | paho 内部管理 |
 | T4 | **用户异步线程** | 应用（线程池 / worker） | handler 派生的后续处理；库**只能**通过 `Lease` 引用计数感知 | 0..N |
 
@@ -147,6 +147,6 @@ running_.exchange(true)  ── 已 true ⇒ 直接返回   running_.exchange(fa
 | 你可以假设 | 你不可以假设 |
 | --- | --- |
 | 任意线程调用 `install/uninstall/set_qos/publish` 与 `Binding::open` / `Subscription::close` 都安全 | handler 会被多个线程并发调用（实际只有 T2 调用它） |
-| handler 内可以安全地 `open/close` 其它（甚至自己）Topic | handler 内可以安全地析构 `MqttClient` |
+| handler 内可以安全地 `open/close` 其它（甚至自己）Subscription | handler 内可以安全地析构 `MqttClient` |
 | `close()` 返回后，同步 handler 一定不再被调用 | `close()` 返回后，**你派生的异步任务**也一定结束了——只有按值捕获了消息副本（凭据）才会等待，见 `05` |
 | 同一个 `Subscription` / `Topic` 不会被两个线程同时 move/open/close（普通对象，需自行保证） | `Subscription::set_qos` / `Topic::publish` 在 move 之后仍可用（会抛 `std::logic_error`） |

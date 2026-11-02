@@ -31,8 +31,38 @@
 | `imqtt_client.h` | 订阅侧最小契约 |
 | `tests/` | 单元测试（自带极简框架，无外部依赖） |
 | `tests/integration/` | 端到端测试 + 极简 mock broker（Python，仅标准库） |
-| `examples/topic_demo.cpp` | 用法示例（离线派发 + 异步 handler + 在线收发） |
-| `docs/` | **技术文档**：架构、数据结构、线程模型、调用链、生命周期与保活、设计取舍 |
+| `examples/topic_demo.cpp` | 用法示例（离线 / 绑定 API / 异步 handler / 在线收发） |
+| `docs/` | **技术文档**：架构、数据结构、线程模型、调用链、生命周期与保活、设计取舍、绑定模型 |
+
+## 绑定模型
+
+绑定被拆成“描述”和“激活”两层，避免旧的 `Topic` 同时管理 handler 所有权、
+slot、move/rebind 与发布：
+
+| 类型 | 角色 | 生命周期 |
+| --- | --- | --- |
+| `Handler` | 类型擦除后的处理器（成员模式零分配 / 可调用模式一次分配） | 由 `Binding` / 目录 `Slot` 持有 |
+| `Binding` | 纯描述符 `(filter, Handler, qos)`；构造期校验，可复用产生多个注册 | 应用决定；无副作用 |
+| `Subscription` | 一次激活的 RAII 凭据；析构/`close()` 退订 | 只移动；move 只搬 slot，无 rebind |
+| `SubscriptionGroup` | 批量绑定 + 批量激活，`open_all` 失败回滚 | 组析构关闭全部 |
+| `Publisher` | 发布目标 `(topic, qos, retain)`，构造期拒绝 `+`/`#` | 无生命周期语义 |
+
+```cpp
+auto binding = mqttx::make_binding("robot/+/cmd",
+                                   mqttx::on<&Robot::on_cmd>(robot), 1);
+auto sub = binding.open(cli);      // 激活；sub 析构即退订
+
+mqttx::SubscriptionGroup group;
+group.add(mqttx::make_binding("robot/alarm", [](const mqttx::MessageView&) {}, 2));
+group.open_all(cli);               // 批量激活，异常自动回滚
+
+mqttx::Publisher pub{cli, "robot/1/cmd", 1};
+pub.publish(payload);              // 发布与订阅完全解耦
+```
+
+只需要一步式时用 `subscribe(...)`；需要在 Session 构造期延迟激活时用
+`make_binding(...)` + `open()`。完整语义见
+[`docs/07-binding-model.md`](docs/07-binding-model.md)。
 
 ## 技术文档（维护者向）
 
@@ -41,11 +71,12 @@
 | 文档 | 内容 |
 | --- | --- |
 | [`docs/01-architecture.md`](docs/01-architecture.md) | 分层架构、模块职责、依赖关系、端到端数据流 |
-| [`docs/02-data-structures.md`](docs/02-data-structures.md) | 核心数据结构与 **15 条不变式** |
+| [`docs/02-data-structures.md`](docs/02-data-structures.md) | 核心数据结构与 **17 条不变式** |
 | [`docs/03-thread-model.md`](docs/03-thread-model.md) | 线程角色、同步原语、锁序与内存序、防死锁规则 |
 | [`docs/04-call-chains.md`](docs/04-call-chains.md) | 8 条函数调用链 + 错误路径一览 |
 | [`docs/05-lifecycle-keepalive.md`](docs/05-lifecycle-keepalive.md) | 生命周期与保活机制、两段等待证明、异步契约、机制↔测试对照 |
 | [`docs/06-design-tradeoffs.md`](docs/06-design-tradeoffs.md) | 需求→复杂度推导、被否决的简单方案、裁剪档位、评审清单 |
+| [`docs/07-binding-model.md`](docs/07-binding-model.md) | Handler / Binding / Subscription / Group / Publisher 的职责、RAII 边界、QoS 与迁移对照 |
 
 
 ## 快速上手
@@ -87,6 +118,15 @@ cli.stop();                       // 幂等；析构也会调用
 auto binding = mqttx::make_binding("robot/+/cmd", mqttx::on<&Robot::on_cmd>(robot), 1);
 // ... 对象完全构造后
 auto subscription = binding.open(cli);
+```
+
+需要批量延迟激活时用 `SubscriptionGroup`：
+
+```cpp
+mqttx::SubscriptionGroup group;
+group.add(mqttx::make_binding<&Robot::on_cmd>("robot/+/cmd", robot, 1));
+group.add(mqttx::make_binding("robot/alarm", [](const mqttx::MessageView&) {}, 2));
+group.open_all(cli);   // 任一失败回滚；group 析构关闭全部
 ```
 
 > **为什么要显式 `open()` / `subscribe` 二选一？**

@@ -15,8 +15,9 @@
 | [`04-call-chains.md`](04-call-chains.md) | 8 条完整调用链（启动、注册、派发、摘除、move、重连、发布、异步） | 跟代码 / 定位问题 |
 | [`05-lifecycle-keepalive.md`](05-lifecycle-keepalive.md) | 四类生命周期、保活凭据、两段等待不变式、异步契约与边界 | 改生命周期 / 排查悬垂与卡死 |
 | [`06-design-tradeoffs.md`](06-design-tradeoffs.md) | 需求→复杂度推导、被否决的简单方案、复杂度账单、裁剪建议 | 评审 / 决定是否简化或替换 |
+| [`07-binding-model.md`](07-binding-model.md) | Handler / Binding / Subscription / Group / Publisher 的职责、RAII 边界、QoS 与迁移对照 | 使用或修改绑定 API |
 
-推荐阅读顺序：`01 → 04 → 05 → 02 → 03 → 06`。
+推荐阅读顺序：`01 → 07 → 04 → 05 → 02 → 03 → 06`。
 只想改一个 handler 的业务逻辑，读 `04` 的「③ 派发链」与 `05` 的「异步契约」即可。
 
 ## 术语表
@@ -43,7 +44,9 @@
   每条机制都尽量给出对应的测试用例（见 [`05`](05-lifecycle-keepalive.md) 末节的可追溯性矩阵）。
 - 文档与代码同步维护：改动 [`../topic_directory.cpp`](../topic_directory.cpp)、
   [`../topic_directory.hpp`](../topic_directory.hpp)、[`../message.hpp`](../message.hpp) 中的
-  生命周期协议时，必须同步更新 `02`、`03`、`05`。
+  生命周期协议时，必须同步更新 `02`、`03`、`05`；
+  改动 [`../handler.hpp`](../handler.hpp)、[`../binding.hpp`](../binding.hpp)、
+  [`../publisher.hpp`](../publisher.hpp) 的公开语义时，必须同步更新 `07`。
 
 ## 代码地图
 
