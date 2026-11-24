@@ -63,8 +63,11 @@ public:
         requires std::is_invocable_v<std::decay_t<F>&, const MessageView&>
     [[nodiscard]] static Handler callable(F&& fn) {
         using Stored = std::decay_t<F>;
-        auto state   = std::make_shared<State<Stored>>(std::forward<F>(fn));
-        return Handler{state.get(), &invoke_state<Stored>, std::move(state)};
+        auto  state  = std::make_shared<State<Stored>>(std::forward<F>(fn));
+        // 先取出裸指针：std::move(state) 会清空 state，而 C++ 不保证实参求值
+        // 顺序（MSVC 从右往左求值），直接在实参里调用 state.get() 会得到空指针。
+        auto* target = state.get();
+        return Handler{target, &invoke_state<Stored>, std::move(state)};
     }
 
 private:
